@@ -32,6 +32,27 @@ class MapConfig:
 
 
 @dataclass(frozen=True)
+class TargetConfig:
+    """Simple visual target profile supplied on the competition day.
+
+    Webots camera images are BGRA, so channel 0 is blue, 1 is green, and 2 is
+    red. Change only this profile when the organiser reveals the target.
+    """
+
+    primary_channel: int = 2
+    secondary_channels: tuple[int, int] = (0, 1)
+    min_primary: int = 135
+    primary_ratio: float = 1.55
+    primary_margin: int = 55
+    min_component_area: int = 10
+    seen_confidence: float = 0.28
+    known_height_m: float = 0.60
+    lidar_bearing_gate_deg: float = 4.5
+    lidar_range_gate_min: float = 0.38
+    lidar_range_gate_ratio: float = 0.38
+
+
+@dataclass(frozen=True)
 class PlannerConfig:
     inflation_radius: float = 0.20
     frontier_min_cells: int = 7
@@ -52,11 +73,14 @@ class MissionConfig:
     bootstrap_rotation: float = 5.9
     bootstrap_timeout: float = 11.0
     target_stable_frames: int = 4
+    required_target_count: int = 3
+    target_dedup_distance: float = 2.2
+    target_rearm_distance: float = 1.2
     target_stop_distance: float = 0.95
     target_confirm_time: float = 1.2
     home_tolerance: float = 0.24
     target_reacquire_timeout: float = 9.0
-    mission_timeout: float = 280.0
+    mission_timeout: float = 360.0
     status_period: float = 2.0
 
 
@@ -73,6 +97,7 @@ class SafetyConfig:
 class Config:
     robot: RobotConfig = field(default_factory=RobotConfig)
     mapping: MapConfig = field(default_factory=MapConfig)
+    target: TargetConfig = field(default_factory=TargetConfig)
     planner: PlannerConfig = field(default_factory=PlannerConfig)
     mission: MissionConfig = field(default_factory=MissionConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)

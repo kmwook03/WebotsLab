@@ -12,7 +12,7 @@ from config import CONFIG
 from localization import PoseEstimator
 from mapping import OccupancyGrid
 from mission import MissionManager
-from models import ControlCommand, LaserScan, MissionPhase, TargetDetection
+from models import ControlCommand, LaserScan, MissionPhase, TargetDetection, angle_difference, wrap_angle
 from perception import RedTargetDetector
 from planning import AStarPlanner, DynamicWindowPlanner, FrontierExplorer
 from safety import SafetySupervisor
@@ -55,7 +55,7 @@ class AutonomousSearchAndRescue:
 
         self.grid = OccupancyGrid(CONFIG.mapping)
         self.estimator = PoseEstimator(CONFIG.robot)
-        self.target_detector = RedTargetDetector()
+        self.target_detector = RedTargetDetector(CONFIG.target)
         self.global_planner = AStarPlanner(CONFIG.planner)
         self.explorer = FrontierExplorer(CONFIG.planner, self.global_planner)
         self.local_planner = DynamicWindowPlanner(CONFIG.robot, CONFIG.planner)
@@ -69,6 +69,10 @@ class AutonomousSearchAndRescue:
         self.last_status_time = -math.inf
         self.last_detection = TargetDetection()
         self.last_command = ControlCommand()
+        self.fallback_heading: Optional[float] = None
+        self.fallback_until = -math.inf
+        self.departure_until = -math.inf
+        self.last_visited_count = 0
         self.step_count = 0
 
     def _scan(self) -> LaserScan:
@@ -153,9 +157,17 @@ class AutonomousSearchAndRescue:
             turn = 0.95 if int(self.step_count / 12) % 2 == 0 else -0.95
             return ControlCommand(-0.055, turn, "stuck recovery")
 
+        # A confirmed object remains in the camera while the robot is at its
+        # stand-off point. Back out along the already observed approach lane so
+        # the detector can re-arm for the next object instead of orbiting the
+        # same one. The independent 360-degree guard still owns final safety.
+        if phase == MissionPhase.EXPLORE and now < self.departure_until:
+            return ControlCommand(-0.18, 0.16, "leave confirmed target")
+
         self._update_plan(now)
         self._prune_path()
         if self.path:
+            self.fallback_heading = None
             return self.local_planner.command(
                 self.estimator.pose,
                 self.estimator.velocity,
@@ -170,6 +182,22 @@ class AutonomousSearchAndRescue:
             approach_speed = float(np.clip(0.09 + 0.045 * range_error, 0.09, 0.22))
             heading_scale = float(np.clip(1.0 - abs(self.last_detection.bearing) / 0.75, 0.35, 1.0))
             return ControlCommand(approach_speed * heading_scale, angular, "visual target servo")
+        if phase == MissionPhase.EXPLORE:
+            if self.fallback_heading is None or now >= self.fallback_until:
+                clearance = np.asarray(scan.ranges, dtype=np.float32).copy()
+                clearance[~np.isfinite(clearance)] = scan.max_range
+                np.clip(clearance, 0.0, scan.max_range, out=clearance)
+                kernel = np.ones(21, dtype=np.float32) / 21.0
+                smoothed = np.convolve(clearance, kernel, mode="same")
+                best_index = int(np.argmax(smoothed))
+                bearing = float(scan.angles[best_index])
+                self.fallback_heading = wrap_angle(self.estimator.pose.theta + bearing)
+                self.fallback_until = now + 8.0
+            heading_error = angle_difference(self.fallback_heading, self.estimator.pose.theta)
+            angular = float(np.clip(1.35 * heading_error, -0.90, 0.90))
+            aligned = max(0.0, 1.0 - abs(heading_error) / 0.65)
+            linear = 0.0 if abs(heading_error) > 0.50 else 0.12 + 0.12 * aligned
+            return ControlCommand(linear, angular, "open-space exploration fallback")
         return ControlCommand(0.0, 0.52, "search for reachable frontier")
 
     def _actuate(self, command: ControlCommand) -> None:
@@ -192,6 +220,8 @@ class AutonomousSearchAndRescue:
             "map_cells": self.grid.observed_count,
             "target_confidence": round(self.last_detection.confidence, 3),
             "target_range": None if self.last_detection.range_m is None else round(self.last_detection.range_m, 3),
+            "targets_visited": self.mission.visited_count,
+            "targets_required": CONFIG.mission.required_target_count,
             "command": [round(self.last_command.linear, 3), round(self.last_command.angular, 3)],
             "reason": self.last_command.reason,
         }
@@ -201,6 +231,7 @@ class AutonomousSearchAndRescue:
             f"pose=({pose.x:+.2f},{pose.y:+.2f},{pose.theta:+.2f}) "
             f"known={status['map_cells']:5d} target={status['target_confidence']:.2f}/"
             f"{status['target_range'] if status['target_range'] is not None else '-'}m "
+            f"visited={status['targets_visited']}/{status['targets_required']} "
             f"cmd=({self.last_command.linear:+.2f},{self.last_command.angular:+.2f}) {self.last_command.reason}"
         )
 
@@ -225,10 +256,19 @@ class AutonomousSearchAndRescue:
                 self.last_detection = self._detection(scan)
 
                 transition = self.mission.update(now, self.estimator.pose, self.last_detection)
+                if self.mission.visited_count > self.last_visited_count:
+                    self.departure_until = now + 7.0
+                    self.last_visited_count = self.mission.visited_count
+                elif transition and "confirmed; resume search" in transition:
+                    # A revisit rejected by spatial de-duplication still needs
+                    # the same departure manoeuvre; otherwise the camera keeps
+                    # reacquiring that already-counted object.
+                    self.departure_until = now + 7.0
                 if transition:
                     print(f"[MISSION] {transition}")
                     self.path = []
                     self.current_goal = None
+                    self.fallback_heading = None
                     if self.mission.phase != MissionPhase.EXPLORE:
                         self.frontier_goal = None
 

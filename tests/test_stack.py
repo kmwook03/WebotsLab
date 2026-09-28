@@ -9,7 +9,7 @@ import numpy as np
 CONTROLLER = Path(__file__).resolve().parents[1] / "controllers" / "amr_search_rescue"
 sys.path.insert(0, str(CONTROLLER))
 
-from config import MapConfig, MissionConfig, PlannerConfig, RobotConfig, SafetyConfig  # noqa: E402
+from config import MapConfig, MissionConfig, PlannerConfig, RobotConfig, SafetyConfig, TargetConfig  # noqa: E402
 from mapping import OccupancyGrid  # noqa: E402
 from mission import MissionManager  # noqa: E402
 from models import ControlCommand, LaserScan, MissionPhase, Pose2D, TargetDetection, Velocity, wrap_angle  # noqa: E402
@@ -91,6 +91,15 @@ class LocalPlanningTests(unittest.TestCase):
         self.assertEqual(command.reason, "360 proximity escape")
         self.assertLess(command.angular, 0.0)
 
+    def test_deliberate_rotation_is_not_reported_as_stuck(self):
+        supervisor = SafetySupervisor(
+            RobotConfig(), SafetyConfig(stuck_window=1.0, stuck_distance=0.08)
+        )
+        command = ControlCommand(0.0, 0.9, "scan")
+
+        for now, theta in ((0.0, 0.0), (0.4, 0.3), (0.8, 0.6), (1.0, 0.9)):
+            self.assertFalse(supervisor.is_stuck(now, Pose2D(theta=theta), command))
+
 
 class PerceptionAndMissionTests(unittest.TestCase):
     def test_red_target_and_lidar_association(self):
@@ -119,10 +128,25 @@ class PerceptionAndMissionTests(unittest.TestCase):
         detection = RedTargetDetector().detect(image.tobytes(), width, height, 1.1, scan)
         self.assertGreater(detection.range_m, 2.0)
 
+    def test_target_colour_profile_is_configurable(self):
+        height, width = 96, 160
+        image = np.zeros((height, width, 4), dtype=np.uint8)
+        image[25:75, 70:90, 0] = 255
+        image[25:75, 70:90, 3] = 255
+        detector = RedTargetDetector(
+            TargetConfig(primary_channel=0, secondary_channels=(1, 2))
+        )
+
+        detection = detector.detect(image.tobytes(), width, height, 1.1)
+
+        self.assertTrue(detection.seen)
+        self.assertAlmostEqual(detection.bearing, 0.0, delta=0.03)
+
     def test_complete_mission_state_sequence(self):
         config = MissionConfig(
             bootstrap_rotation=1.0,
             target_stable_frames=2,
+            required_target_count=1,
             target_confirm_time=0.1,
         )
         mission = MissionManager(config)
@@ -141,6 +165,61 @@ class PerceptionAndMissionTests(unittest.TestCase):
         self.assertEqual(mission.phase, MissionPhase.RETURN_HOME)
         mission.update(1.6, Pose2D(), TargetDetection())
         self.assertEqual(mission.phase, MissionPhase.COMPLETE)
+
+    def test_multiple_targets_are_visited_before_return(self):
+        config = MissionConfig(
+            bootstrap_rotation=1.0,
+            target_stable_frames=2,
+            required_target_count=2,
+            target_dedup_distance=0.8,
+            target_confirm_time=0.1,
+        )
+        mission = MissionManager(config)
+        mission.start(0.0, Pose2D())
+        mission.update(0.5, Pose2D(theta=0.6), TargetDetection())
+        mission.update(1.0, Pose2D(theta=1.2), TargetDetection())
+        seen = TargetDetection(seen=True, confidence=0.9, range_m=1.2)
+        close = TargetDetection(seen=True, confidence=0.9, range_m=0.45)
+
+        mission.update(1.1, Pose2D(theta=1.2), seen)
+        mission.update(1.2, Pose2D(theta=1.2), seen)
+        mission.update(1.3, Pose2D(theta=1.2), close)
+        mission.update(1.5, Pose2D(theta=1.2), close)
+        self.assertEqual(mission.phase, MissionPhase.EXPLORE)
+        self.assertEqual(mission.visited_count, 1)
+
+        mission.update(1.55, Pose2D(theta=1.2), seen)
+        mission.update(1.58, Pose2D(theta=1.2), seen)
+        self.assertEqual(mission.phase, MissionPhase.EXPLORE)
+        self.assertEqual(mission.visited_count, 1)
+
+        second_pose = Pose2D(x=3.0, theta=1.2)
+        mission.update(1.6, second_pose, seen)
+        mission.update(1.7, second_pose, seen)
+        mission.update(1.8, second_pose, close)
+        mission.update(2.0, second_pose, close)
+        self.assertEqual(mission.phase, MissionPhase.RETURN_HOME)
+        self.assertEqual(mission.visited_count, 2)
+
+    def test_lost_target_returns_to_exploration(self):
+        config = MissionConfig(
+            bootstrap_rotation=1.0,
+            target_stable_frames=2,
+            required_target_count=2,
+            target_reacquire_timeout=2.0,
+        )
+        mission = MissionManager(config)
+        mission.start(0.0, Pose2D())
+        mission.update(0.5, Pose2D(theta=0.6), TargetDetection())
+        mission.update(1.0, Pose2D(theta=1.2), TargetDetection())
+        seen = TargetDetection(seen=True, confidence=0.9, range_m=2.5)
+        mission.update(1.1, Pose2D(theta=1.2), seen)
+        mission.update(1.2, Pose2D(theta=1.2), seen)
+        self.assertEqual(mission.phase, MissionPhase.TARGET_APPROACH)
+
+        mission.update(3.3, Pose2D(x=-2.0), TargetDetection())
+
+        self.assertEqual(mission.phase, MissionPhase.EXPLORE)
 
 
 if __name__ == "__main__":

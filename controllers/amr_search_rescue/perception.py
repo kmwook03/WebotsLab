@@ -5,13 +5,15 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from config import TargetConfig
 from models import LaserScan, TargetDetection
 
 
 class RedTargetDetector:
-    """Detect the supplied bright-red rescue marker without simulator labels."""
+    """Detect a simple configured colour target without simulator labels."""
 
-    def __init__(self):
+    def __init__(self, config: Optional[TargetConfig] = None):
+        self.config = config or TargetConfig()
         self.filtered_confidence = 0.0
         self.filtered_bearing = 0.0
 
@@ -43,11 +45,10 @@ class RedTargetDetector:
                 best = candidate
         return best
 
-    @staticmethod
-    def associate_range(scan: LaserScan, bearing: float) -> Optional[float]:
+    def associate_range(self, scan: LaserScan, bearing: float) -> Optional[float]:
         difference = np.abs(np.arctan2(np.sin(scan.angles - bearing), np.cos(scan.angles - bearing)))
         mask = (
-            (difference < math.radians(4.5))
+            (difference < math.radians(self.config.lidar_bearing_gate_deg))
             & scan.valid_mask(include_max_range=False)
         )
         values = scan.ranges[mask]
@@ -68,10 +69,15 @@ class RedTargetDetector:
         image = np.frombuffer(bgra, dtype=np.uint8).reshape((height, width, 4))
         # Half resolution is enough for a coloured rescue marker and bounds CPU.
         sample = image[::2, ::2, :]
-        blue = sample[:, :, 0].astype(np.int16)
-        green = sample[:, :, 1].astype(np.int16)
-        red = sample[:, :, 2].astype(np.int16)
-        mask = (red > 135) & (red > green * 1.55) & (red > blue * 1.55) & ((red - green) > 55)
+        primary = sample[:, :, self.config.primary_channel].astype(np.int16)
+        secondary_a = sample[:, :, self.config.secondary_channels[0]].astype(np.int16)
+        secondary_b = sample[:, :, self.config.secondary_channels[1]].astype(np.int16)
+        mask = (
+            (primary > self.config.min_primary)
+            & (primary > secondary_a * self.config.primary_ratio)
+            & (primary > secondary_b * self.config.primary_ratio)
+            & ((primary - np.maximum(secondary_a, secondary_b)) > self.config.primary_margin)
+        )
 
         # A 3-neighbour filter rejects isolated hot pixels and texture noise.
         neighbours = mask.astype(np.uint8)
@@ -81,7 +87,7 @@ class RedTargetDetector:
         neighbours[:, :-1] += mask[:, 1:]
         clean = mask & (neighbours >= 3)
         component = self._largest_component(clean)
-        if component is None or component[0] < 10:
+        if component is None or component[0] < self.config.min_component_area:
             self.filtered_confidence *= 0.72
             return TargetDetection(confidence=self.filtered_confidence)
 
@@ -100,15 +106,20 @@ class RedTargetDetector:
         vertical_fov = 2.0 * math.atan(math.tan(0.5 * field_of_view) * height / width)
         focal_y = 0.5 * height / max(1e-6, math.tan(0.5 * vertical_fov))
         full_resolution_height = max(1.0, 2.0 * box_height)
-        monocular_distance = float(np.clip(0.60 * focal_y / full_resolution_height, 0.30, 8.0))
+        monocular_distance = float(
+            np.clip(self.config.known_height_m * focal_y / full_resolution_height, 0.30, 8.0)
+        )
         lidar_distance = self.associate_range(scan, self.filtered_bearing) if scan is not None else None
-        gate = max(0.38, 0.38 * monocular_distance)
+        gate = max(
+            self.config.lidar_range_gate_min,
+            self.config.lidar_range_gate_ratio * monocular_distance,
+        )
         if lidar_distance is not None and abs(lidar_distance - monocular_distance) <= gate:
             distance = 0.72 * lidar_distance + 0.28 * monocular_distance
         else:
             distance = monocular_distance
         return TargetDetection(
-            seen=self.filtered_confidence >= 0.28,
+            seen=self.filtered_confidence >= self.config.seen_confidence,
             bearing=self.filtered_bearing,
             confidence=self.filtered_confidence,
             area_ratio=area_ratio,

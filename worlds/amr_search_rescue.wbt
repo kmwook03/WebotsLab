@@ -9,8 +9,8 @@ WorldInfo {
   ]
 }
 Viewpoint {
-  orientation 0.3961 0.8908 0.2227 1.667
-  position -8.2 -8.6 10.4
+  orientation -0.230411656391785 0.5298718387957241 0.8161778623866444 0.9790545501624465
+  position -10.692536013113205 -12.289374164578515 9.82161403257151
   follow "TurtleBot3Burger"
   followType "Pan and Tilt Shot"
 }
@@ -138,6 +138,19 @@ Solid {
 }
 
 Solid {
+  translation -2.35 1.20 0.25
+  children [
+    Shape {
+      appearance USE WALL_APPEARANCE
+      geometry Box { size 1.50 0.15 0.50 }
+    }
+  ]
+  name "maze wall D"
+  boundingObject Box { size 1.50 0.15 0.50 }
+  locked TRUE
+}
+
+Solid {
   translation -2.55 1.45 0.24
   children [
     DEF CRATE_SHAPE Shape {
@@ -169,9 +182,9 @@ Solid {
 }
 
 DEF RESCUE_TARGET Solid {
-  translation 2.65 -2.20 0.30
+  translation -0.65 -0.25 0.30
   children [
-    Shape {
+    DEF RESCUE_TARGET_SHAPE Shape {
       appearance PBRAppearance {
         baseColor 1 0.015 0.015
         emissiveColor 0.16 0 0
@@ -181,7 +194,23 @@ DEF RESCUE_TARGET Solid {
       geometry Box { size 0.28 0.28 0.60 }
     }
   ]
-  name "red rescue marker"
+  name "red rescue marker 1"
+  boundingObject Box { size 0.28 0.28 0.60 }
+  locked TRUE
+}
+
+DEF RESCUE_TARGET_2 Solid {
+  translation -2.65 2.30 0.30
+  children [ USE RESCUE_TARGET_SHAPE ]
+  name "red rescue marker 2"
+  boundingObject Box { size 0.28 0.28 0.60 }
+  locked TRUE
+}
+
+DEF RESCUE_TARGET_3 Solid {
+  translation 2.70 2.55 0.30
+  children [ USE RESCUE_TARGET_SHAPE ]
+  name "red rescue marker 3"
   boundingObject Box { size 0.28 0.28 0.60 }
   locked TRUE
 }
@@ -266,7 +295,7 @@ DEF MOVING_PERSON_2 Solid {
 }
 
 DEF MOVING_PERSON_3 Solid {
-  translation -1.21 2.96 0.62
+  translation -1.32 3.16 0.62
   children [
     Pose {
       translation 0 0 -0.05
