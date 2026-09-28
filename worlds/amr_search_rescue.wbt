@@ -1,0 +1,425 @@
+#VRML_SIM R2025a utf8
+
+WorldInfo {
+  basicTimeStep 64
+  title "TECH WEEK Autonomous Search and Rescue"
+  info [
+    "Unknown-map AMR mission: explore, find the red rescue marker, approach, and return home."
+    "The AMR has no GPS and receives no ground-truth data from the evaluator."
+  ]
+}
+Viewpoint {
+  orientation 0.3961 0.8908 0.2227 1.667
+  position -8.2 -8.6 10.4
+  follow "TurtleBot3Burger"
+  followType "Pan and Tilt Shot"
+}
+Background {
+  skyColor [
+    0.82 0.88 0.96
+  ]
+}
+DirectionalLight {
+  ambientIntensity 0.75
+  direction -0.3 -0.4 -1
+  intensity 1.0
+}
+
+DEF FLOOR Solid {
+  translation 0 0 -0.05
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.72 0.73 0.70
+        roughness 0.92
+        metalness 0
+      }
+      geometry Box {
+        size 7 7 0.1
+      }
+    }
+  ]
+  name "floor"
+  boundingObject Box {
+    size 7 7 0.1
+  }
+  locked TRUE
+}
+
+# Boundary walls.
+Solid {
+  translation 0 -3.5 0.25
+  children [
+    DEF WALL_SHAPE Shape {
+      appearance DEF WALL_APPEARANCE PBRAppearance {
+        baseColor 0.72 0.76 0.80
+        roughness 0.8
+        metalness 0
+      }
+      geometry Box {
+        size 7.2 0.12 0.5
+      }
+    }
+  ]
+  name "south boundary"
+  boundingObject Box {
+    size 7.2 0.12 0.5
+  }
+  locked TRUE
+}
+Solid {
+  translation 0 3.5 0.25
+  children [ USE WALL_SHAPE ]
+  name "north boundary"
+  boundingObject Box { size 7.2 0.12 0.5 }
+  locked TRUE
+}
+Solid {
+  translation -3.5 0 0.25
+  children [
+    Shape {
+      appearance USE WALL_APPEARANCE
+      geometry Box { size 0.12 7.2 0.5 }
+    }
+  ]
+  name "west boundary"
+  boundingObject Box { size 0.12 7.2 0.5 }
+  locked TRUE
+}
+Solid {
+  translation 3.5 0 0.25
+  children [
+    Shape {
+      appearance USE WALL_APPEARANCE
+      geometry Box { size 0.12 7.2 0.5 }
+    }
+  ]
+  name "east boundary"
+  boundingObject Box { size 0.12 7.2 0.5 }
+  locked TRUE
+}
+
+# Three connected baffles create occluded rooms without making a closed trap.
+Solid {
+  translation -1.4 -0.75 0.25
+  children [
+    Shape {
+      appearance USE WALL_APPEARANCE
+      geometry Box { size 0.15 1.5 0.5 }
+    }
+  ]
+  name "maze wall A"
+  boundingObject Box { size 0.15 1.5 0.5 }
+  locked TRUE
+}
+Solid {
+  translation 0.1 0.55 0.25
+  children [
+    Shape {
+      appearance USE WALL_APPEARANCE
+      geometry Box { size 3.0 0.15 0.5 }
+    }
+  ]
+  name "maze wall B"
+  boundingObject Box { size 3.0 0.15 0.5 }
+  locked TRUE
+}
+Solid {
+  translation 1.6 1.60 0.25
+  children [
+    Shape {
+      appearance USE WALL_APPEARANCE
+      geometry Box { size 0.15 2.1 0.5 }
+    }
+  ]
+  name "maze wall C"
+  boundingObject Box { size 0.15 2.1 0.5 }
+  locked TRUE
+}
+
+Solid {
+  translation -2.55 1.45 0.24
+  children [
+    DEF CRATE_SHAPE Shape {
+      appearance DEF CRATE_APPEARANCE PBRAppearance {
+        baseColor 0.34 0.22 0.12
+        roughness 0.9
+        metalness 0
+      }
+      geometry Box { size 0.48 0.48 0.48 }
+    }
+  ]
+  name "crate 1"
+  boundingObject Box { size 0.48 0.48 0.48 }
+  locked TRUE
+}
+Solid {
+  translation 0.45 2.25 0.24
+  children [ USE CRATE_SHAPE ]
+  name "crate 2"
+  boundingObject Box { size 0.48 0.48 0.48 }
+  locked TRUE
+}
+Solid {
+  translation 2.45 -1.10 0.24
+  children [ USE CRATE_SHAPE ]
+  name "crate 3"
+  boundingObject Box { size 0.48 0.48 0.48 }
+  locked TRUE
+}
+
+DEF RESCUE_TARGET Solid {
+  translation 2.65 -2.20 0.30
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 1 0.015 0.015
+        emissiveColor 0.16 0 0
+        roughness 0.65
+        metalness 0
+      }
+      geometry Box { size 0.28 0.28 0.60 }
+    }
+  ]
+  name "red rescue marker"
+  boundingObject Box { size 0.28 0.28 0.60 }
+  locked TRUE
+}
+
+DEF MOVING_PERSON Solid {
+  translation -0.6 -1.75 0.62
+  children [
+    Pose {
+      translation 0 0 -0.05
+      children [
+        DEF PERSON_BODY_SHAPE Shape {
+          appearance PBRAppearance {
+            baseColor 0.08 0.25 0.72
+            roughness 0.9
+            metalness 0
+          }
+          geometry Box { size 0.30 0.24 0.72 }
+        }
+      ]
+    }
+    Pose {
+      translation 0 0 0.43
+      children [
+        DEF PERSON_HEAD_SHAPE Shape {
+          appearance PBRAppearance {
+            baseColor 0.68 0.45 0.30
+            roughness 0.9
+            metalness 0
+          }
+          geometry Sphere { radius 0.16 }
+        }
+      ]
+    }
+    Pose {
+      translation 0.085 0 -0.46
+      children [
+        DEF PERSON_LEG_SHAPE Shape {
+          appearance PBRAppearance { baseColor 0.08 0.10 0.16 roughness 0.9 metalness 0 }
+          geometry Box { size 0.10 0.16 0.40 }
+        }
+      ]
+    }
+    Pose {
+      translation -0.085 0 -0.46
+      children [
+        USE PERSON_LEG_SHAPE
+      ]
+    }
+  ]
+  name "moving person"
+  boundingObject Pose {
+    translation 0 0 -0.04
+    children [ Box { size 0.34 0.30 1.12 } ]
+  }
+}
+
+DEF MOVING_PERSON_2 Solid {
+  translation 2.06 -0.28 0.62
+  children [
+    Pose {
+      translation 0 0 -0.05
+      children [ USE PERSON_BODY_SHAPE ]
+    }
+    Pose {
+      translation 0 0 0.43
+      children [ USE PERSON_HEAD_SHAPE ]
+    }
+    Pose {
+      translation 0.085 0 -0.46
+      children [ USE PERSON_LEG_SHAPE ]
+    }
+    Pose {
+      translation -0.085 0 -0.46
+      children [ USE PERSON_LEG_SHAPE ]
+    }
+  ]
+  name "moving person 2"
+  boundingObject Pose {
+    translation 0 0 -0.04
+    children [ Box { size 0.34 0.30 1.12 } ]
+  }
+}
+
+DEF MOVING_PERSON_3 Solid {
+  translation -1.21 2.96 0.62
+  children [
+    Pose {
+      translation 0 0 -0.05
+      children [ USE PERSON_BODY_SHAPE ]
+    }
+    Pose {
+      translation 0 0 0.43
+      children [ USE PERSON_HEAD_SHAPE ]
+    }
+    Pose {
+      translation 0.085 0 -0.46
+      children [ USE PERSON_LEG_SHAPE ]
+    }
+    Pose {
+      translation -0.085 0 -0.46
+      children [ USE PERSON_LEG_SHAPE ]
+    }
+  ]
+  name "moving person 3"
+  boundingObject Pose {
+    translation 0 0 -0.04
+    children [ Box { size 0.34 0.30 1.12 } ]
+  }
+}
+
+DEF AMR Robot {
+  translation -2.80 -2.80 0
+  children [
+    Pose {
+      translation 0 0 0.105
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.06 0.10 0.15
+            roughness 0.55
+            metalness 0.25
+          }
+          geometry Box { size 0.22 0.15 0.14 }
+        }
+      ]
+    }
+    Pose {
+      translation 0.02 0 0.185
+      children [
+        Shape {
+          appearance PBRAppearance { baseColor 0.08 0.55 0.78 roughness 0.5 metalness 0 }
+          geometry Box { size 0.16 0.13 0.025 }
+        }
+      ]
+    }
+    HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 1 0
+        anchor 0 -0.08 0.033
+      }
+      device [
+        RotationalMotor { name "right wheel motor" maxVelocity 10.0 }
+        PositionSensor { name "right wheel sensor" resolution 0.001 }
+      ]
+      endPoint Solid {
+        translation 0 -0.08 0.033
+        rotation 1 0 0 1.5708
+        children [
+          DEF WHEEL_SHAPE Shape {
+            appearance PBRAppearance { baseColor 0.025 0.025 0.025 roughness 1 metalness 0 }
+            geometry Cylinder { height 0.020 radius 0.033 subdivision 24 }
+          }
+        ]
+        name "right wheel"
+        boundingObject Cylinder { height 0.020 radius 0.033 subdivision 16 }
+        physics Physics { density -1 mass 0.04 }
+      }
+    }
+    HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 1 0
+        anchor 0 0.08 0.033
+      }
+      device [
+        RotationalMotor { name "left wheel motor" maxVelocity 10.0 }
+        PositionSensor { name "left wheel sensor" resolution 0.001 }
+      ]
+      endPoint Solid {
+        translation 0 0.08 0.033
+        rotation 1 0 0 1.5708
+        children [ USE WHEEL_SHAPE ]
+        name "left wheel"
+        boundingObject Cylinder { height 0.020 radius 0.033 subdivision 16 }
+        physics Physics { density -1 mass 0.04 }
+      }
+    }
+    BallJoint {
+      jointParameters BallJointParameters { anchor -0.09 0 0.014 }
+      endPoint Solid {
+        translation -0.09 0 0.014
+        children [
+          Shape {
+            appearance PBRAppearance { baseColor 0.12 0.12 0.12 roughness 1 metalness 0 }
+            geometry DEF CASTER Sphere { radius 0.014 subdivision 2 }
+          }
+        ]
+        name "caster"
+        boundingObject USE CASTER
+        physics Physics { density -1 mass 0.02 }
+      }
+    }
+    Lidar {
+      translation 0 0 0.215
+      name "LDS-01"
+      horizontalResolution 360
+      fieldOfView 6.28318
+      numberOfLayers 1
+      near 0.07
+      minRange 0.12
+      maxRange 3.5
+      noise 0.0043
+    }
+    Camera {
+      translation 0.105 0 0.235
+      rotation 0 1 0 0
+      name "camera"
+      fieldOfView 1.10
+      width 160
+      height 96
+      near 0.03
+    }
+    Gyro { name "gyro" }
+    Display { name "map display" width 280 height 280 }
+    Emitter { name "mission emitter" channel 7 }
+  ]
+  name "TurtleBot3Burger"
+  controller "amr_search_rescue"
+  boundingObject Pose {
+    translation 0 0 0.105
+    children [ Box { size 0.22 0.15 0.14 } ]
+  }
+  physics Physics {
+    density -1
+    mass 0.92
+    centerOfMass [ 0 0 0.08 ]
+  }
+}
+
+Robot {
+  translation 0 0 -0.20
+  children [
+    Receiver {
+      name "evaluator receiver"
+      channel 7
+    }
+  ]
+  name "mission evaluator"
+  controller "mission_evaluator"
+  supervisor TRUE
+}
+

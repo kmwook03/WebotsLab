@@ -1,0 +1,612 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TECH WEEK AMR 자율주행 아키텍처 및 현장 운용 가이드</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: light-dark(#f4f7fb, #11161d);
+      --paper: light-dark(#ffffff, #19212b);
+      --paper-soft: light-dark(#f7f9fc, #202a36);
+      --text: light-dark(#172033, #edf3fa);
+      --muted: light-dark(#596579, #aeb9c8);
+      --line: light-dark(#dce3ed, #344252);
+      --accent: light-dark(#075fb8, #66b3ff);
+      --accent-soft: light-dark(#eaf4ff, #18334d);
+      --safe: light-dark(#167447, #6bd7a3);
+      --warn: light-dark(#a45300, #ffc273);
+      --danger: light-dark(#b42318, #ff8f87);
+      --code: light-dark(#eef2f7, #10161d);
+      --shadow: light-dark(0 14px 40px rgba(34, 52, 82, .10), 0 14px 40px rgba(0, 0, 0, .25));
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Pretendard", "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif;
+      line-height: 1.7;
+    }
+    a { color: var(--accent); }
+    .page {
+      width: min(1120px, calc(100% - 32px));
+      margin: 32px auto 64px;
+    }
+    .hero, .section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+    }
+    .hero {
+      padding: 48px;
+      border-radius: 24px;
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--accent-soft) 76%, transparent), transparent 60%),
+        var(--paper);
+    }
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--accent);
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    h1, h2, h3 { line-height: 1.3; }
+    h1 { margin: 0; font-size: clamp(2rem, 5vw, 3.45rem); letter-spacing: -.04em; }
+    h2 { margin: 0 0 20px; font-size: 1.65rem; letter-spacing: -.02em; }
+    h3 { margin: 30px 0 10px; font-size: 1.12rem; }
+    p { margin: 10px 0; }
+    .lede { max-width: 820px; margin-top: 18px; color: var(--muted); font-size: 1.08rem; }
+    .status-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--text);
+      font-size: .9rem;
+      font-weight: 650;
+    }
+    .badge.ok { color: var(--safe); }
+    .toc {
+      margin: 20px 0;
+      padding: 22px 28px;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+    }
+    .toc strong { display: block; margin-bottom: 8px; }
+    .toc ol { margin: 0; padding-left: 22px; columns: 2; column-gap: 42px; }
+    .toc li { break-inside: avoid; margin: 4px 0; }
+    .section { margin-top: 20px; padding: 34px; border-radius: 18px; }
+    .note, .warning, .success {
+      margin: 18px 0;
+      padding: 16px 18px;
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      background: var(--accent-soft);
+    }
+    .warning { border-color: var(--warn); }
+    .success { border-color: var(--safe); }
+    code, pre { font-family: "Cascadia Code", "D2Coding", Consolas, monospace; }
+    code { font-size: .92em; }
+    pre {
+      overflow-x: auto;
+      margin: 14px 0;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--code);
+      line-height: 1.55;
+    }
+    .tree { white-space: pre; }
+    .flow-wrap { overflow-x: auto; padding: 8px 0 2px; }
+    .flow { min-width: 920px; width: 100%; height: auto; }
+    .flow .node { fill: var(--paper-soft); stroke: var(--line); stroke-width: 2; }
+    .flow .safety { fill: color-mix(in srgb, var(--safe) 12%, var(--paper)); stroke: var(--safe); }
+    .flow .mission { fill: color-mix(in srgb, var(--accent) 10%, var(--paper)); stroke: var(--accent); }
+    .flow .eval { fill: color-mix(in srgb, var(--warn) 10%, var(--paper)); stroke: var(--warn); }
+    .flow text { fill: var(--text); font-size: 14px; font-family: inherit; text-anchor: middle; }
+    .flow .small { fill: var(--muted); font-size: 12px; }
+    .flow path { fill: none; stroke: var(--muted); stroke-width: 2; marker-end: url(#arrow); }
+    .flow path.dashed { stroke-dasharray: 7 6; }
+    .steps { counter-reset: step; display: grid; gap: 18px; }
+    .step {
+      position: relative;
+      padding: 22px 22px 22px 72px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--paper-soft);
+    }
+    .step::before {
+      counter-increment: step;
+      content: counter(step);
+      position: absolute;
+      left: 20px;
+      top: 20px;
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: var(--paper);
+      font-weight: 800;
+    }
+    .step h3 { margin-top: 0; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .mini {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--paper-soft);
+    }
+    .mini h3 { margin-top: 0; }
+    table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+    th, td { padding: 12px 13px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }
+    th { background: var(--paper-soft); font-weight: 700; }
+    ul, ol { padding-left: 24px; }
+    li { margin: 6px 0; }
+    .checklist { list-style: none; padding-left: 0; }
+    .checklist li { position: relative; padding-left: 28px; }
+    .checklist li::before { content: "□"; position: absolute; left: 0; color: var(--accent); font-weight: 800; }
+    .footer { margin-top: 20px; color: var(--muted); text-align: center; font-size: .9rem; }
+
+    @media (max-width: 760px) {
+      .page { width: min(100% - 20px, 1120px); margin-top: 10px; }
+      .hero, .section { padding: 24px; border-radius: 14px; }
+      .toc ol { columns: 1; }
+      .grid-2 { grid-template-columns: 1fr; }
+      .step { padding-left: 66px; }
+      table { display: block; overflow-x: auto; }
+    }
+
+    @media print {
+      :root { color-scheme: light; }
+      body { background: #fff; font-size: 10pt; }
+      .page { width: 100%; margin: 0; }
+      .hero, .section, .toc { box-shadow: none; break-inside: avoid; }
+      .section { border-color: #ccd3dc; }
+      a { color: inherit; text-decoration: none; }
+      pre { white-space: pre-wrap; }
+      h2, h3 { break-after: avoid; }
+      table, .step, .mini { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <p class="eyebrow">Pusan National University · TECH WEEK Hackathon</p>
+      <h1>AMR 자율주행 아키텍처<br>및 현장 운용 가이드</h1>
+      <p class="lede">
+        미지 환경에서 지도를 작성하고, 시각 표적을 찾은 뒤 안전하게 접근하고 출발점으로 복귀하는
+        Webots 자율주행 프로젝트의 구현 구조와 해커톤 현장 적용 절차를 설명한다.
+      </p>
+      <div class="status-row">
+        <span class="badge">프로젝트: tech_week_amr</span>
+        <span class="badge">Webots R2025a</span>
+        <span class="badge">Python + NumPy</span>
+        <span class="badge">3인 동적 방해 시나리오</span>
+        <span class="badge ok">단위 테스트 9/9 통과</span>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="목차">
+      <strong>목차</strong>
+      <ol>
+        <li><a href="#overview">설계 개요</a></li>
+        <li><a href="#structure">프로젝트 구조</a></li>
+        <li><a href="#implementation">단계별 구현</a></li>
+        <li><a href="#run">설치 및 실행</a></li>
+        <li><a href="#integration">공식 월드 통합</a></li>
+        <li><a href="#tuning">현장 튜닝</a></li>
+        <li><a href="#test-plan">현장 시험 순서</a></li>
+        <li><a href="#troubleshooting">증상별 대응</a></li>
+        <li><a href="#limits">현재 한계</a></li>
+      </ol>
+    </nav>
+
+    <section class="section" id="overview">
+      <h2>1. 설계 개요</h2>
+      <p>
+        이 프로젝트는 센서, 상태추정, 지도작성, 인식, 임무판단, 경로계획, 안전제어를 분리한 계층형 구조다.
+        Webots API에 직접 의존하는 부분은 메인 어댑터에 집중시키고, 나머지 알고리즘은 일반 데이터 구조와
+        NumPy 배열을 사용한다. 따라서 각 알고리즘을 Webots 없이 단위 테스트할 수 있고 다른 차동구동 로봇에도
+        비교적 쉽게 이식할 수 있다.
+      </p>
+
+      <div class="flow-wrap" aria-label="자율주행 데이터 흐름도">
+        <svg class="flow" viewBox="0 0 1000 430" role="img" aria-labelledby="flow-title flow-desc">
+          <title id="flow-title">AMR 자율주행 데이터 흐름</title>
+          <desc id="flow-desc">센서에서 위치추정, 지도작성, 인식, 임무판단, 전역 및 지역 계획, 안전 검사와 모터 출력으로 이어지는 흐름이다.</desc>
+          <defs>
+            <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+              <polygon points="0 0, 8 3.5, 0 7" fill="context-stroke"></polygon>
+            </marker>
+          </defs>
+          <rect class="node" x="20" y="50" width="170" height="72" rx="12"></rect>
+          <text x="105" y="80">Wheel · Gyro · LiDAR</text><text class="small" x="105" y="102">Camera sensors</text>
+          <rect class="node" x="250" y="50" width="180" height="72" rx="12"></rect>
+          <text x="340" y="80">Webots Adapter</text><text class="small" x="340" y="102">main control loop</text>
+          <rect class="node" x="490" y="25" width="190" height="72" rx="12"></rect>
+          <text x="585" y="55">Localization</text><text class="small" x="585" y="77">odometry + scan matching</text>
+          <rect class="node" x="490" y="130" width="190" height="72" rx="12"></rect>
+          <text x="585" y="160">Occupancy Grid</text><text class="small" x="585" y="182">mapping + decay</text>
+          <rect class="node" x="250" y="180" width="180" height="72" rx="12"></rect>
+          <text x="340" y="210">Target Perception</text><text class="small" x="340" y="232">RGB + LiDAR fusion</text>
+          <rect class="node mission" x="250" y="310" width="180" height="72" rx="12"></rect>
+          <text x="340" y="340">Mission Manager</text><text class="small" x="340" y="362">explicit state machine</text>
+          <rect class="node" x="740" y="130" width="190" height="72" rx="12"></rect>
+          <text x="835" y="160">Frontier + A*</text><text class="small" x="835" y="182">global planning</text>
+          <rect class="node" x="740" y="235" width="190" height="72" rx="12"></rect>
+          <text x="835" y="265">DWA</text><text class="small" x="835" y="287">local trajectory control</text>
+          <rect class="node safety" x="740" y="340" width="190" height="72" rx="12"></rect>
+          <text x="835" y="370">Safety Guard</text><text class="small" x="835" y="392">360° proximity + TTC</text>
+          <rect class="node eval" x="20" y="310" width="170" height="72" rx="12"></rect>
+          <text x="105" y="340">Evaluator</text><text class="small" x="105" y="362">one-way observation only</text>
+          <path d="M190 86 H250"></path>
+          <path d="M430 72 H490"></path>
+          <path d="M585 97 V130"></path>
+          <path d="M340 122 V180"></path>
+          <path d="M340 252 V310"></path>
+          <path d="M680 166 H740"></path>
+          <path d="M430 346 H650 Q710 346 710 271 H740"></path>
+          <path d="M835 202 V235"></path>
+          <path d="M835 307 V340"></path>
+          <path class="dashed" d="M250 86 H215 Q205 86 205 115 V325 Q205 346 190 346"></path>
+        </svg>
+      </div>
+
+      <div class="note">
+        <strong>중요:</strong> 로봇 컨트롤러는 Webots의 실제 위치, 표적 위치 또는 객체 라벨을 읽지 않는다.
+        Supervisor 기반 evaluator는 시험 결과만 관찰하고 로봇에는 정보를 보내지 않는다.
+      </div>
+    </section>
+
+    <section class="section" id="structure">
+      <h2>2. 프로젝트 구조</h2>
+      <pre class="tree"><code>tech_week_amr/
+├─ worlds/
+│  └─ amr_search_rescue.wbt
+├─ controllers/
+│  ├─ amr_search_rescue/
+│  │  ├─ amr_search_rescue.py   # Webots 연결 및 메인 루프
+│  │  ├─ config.py              # 물리·지도·계획·미션·안전 파라미터
+│  │  ├─ models.py              # 공통 데이터 모델
+│  │  ├─ localization.py        # 오도메트리 + scan matching
+│  │  ├─ mapping.py             # log-odds occupancy grid
+│  │  ├─ perception.py          # 빨간 표적 인식
+│  │  ├─ planning.py            # Frontier + A* + DWA
+│  │  ├─ mission.py             # 미션 상태기계
+│  │  ├─ safety.py              # 충돌방지 + stuck recovery
+│  │  └─ visualization.py       # 지도 표시
+│  └─ mission_evaluator/
+│     └─ mission_evaluator.py   # 로컬 검증용 Supervisor
+├─ tests/
+│  └─ test_stack.py
+├─ requirements.txt
+└─ README.md</code></pre>
+      <p>
+        <code>amr_search_rescue.py</code>만 Webots 장치 API와 직접 통신한다. 나머지 모듈은
+        <code>Pose2D</code>, <code>LaserScan</code>, <code>TargetDetection</code> 등의 명확한 인터페이스로 연결된다.
+      </p>
+    </section>
+
+    <section class="section" id="implementation">
+      <h2>3. 단계별 구현</h2>
+      <div class="steps">
+        <article class="step">
+          <h3>Webots 장치 초기화</h3>
+          <p>모터를 속도 제어 모드로 전환하고 엔코더, 자이로, LiDAR, 카메라를 64ms 주기로 활성화한다.</p>
+          <p>필수 장치 이름: <code>left/right wheel motor</code>, <code>left/right wheel sensor</code>,
+             <code>gyro</code>, <code>LDS-01</code>, <code>camera</code>.</p>
+        </article>
+
+        <article class="step">
+          <h3>로컬 좌표계 설정</h3>
+          <p>
+            시작 순간의 추정 자세를 <code>(0, 0, 0)</code>으로 저장한다. 월드에 배치된 실제 좌표와 무관하게
+            모든 지도, 표적 위치와 복귀 경로가 시작점 중심 좌표계에서 계산된다.
+          </p>
+        </article>
+
+        <article class="step">
+          <h3>BOOTSTRAP 초기 스캔</h3>
+          <p>
+            선속도 0, 각속도 0.72rad/s로 제자리 회전한다. 누적 회전량이 5.9rad 이상이거나 11초가 지나면
+            <code>EXPLORE</code> 상태로 전환한다.
+          </p>
+        </article>
+
+        <article class="step">
+          <h3>위치추정</h3>
+          <p>엔코더 이동량으로 차동구동 오도메트리를 계산하고 바퀴 회전량과 자이로 회전량을 0.82:0.18로 융합한다.</p>
+          <pre><code>distance = (left_distance + right_distance) / 2
+rotation = (right_distance - left_distance) / axle_length</code></pre>
+          <p>
+            약 1.02초마다 LiDAR 점군을 기존 지도와 비교한다. 점수가 0.18 이상이고 오도메트리 예측보다
+            0.035 이상 개선될 때만 scan matching 보정을 수용하며, 보정 gain은 최대 0.12로 제한한다.
+          </p>
+        </article>
+
+        <article class="step">
+          <h3>Occupancy Grid 지도작성</h3>
+          <p>
+            280×280 셀, 0.05m 해상도로 총 14×14m 지도를 구성한다. LiDAR 광선이 통과한 셀에는 free 증거를,
+            끝점에는 occupied 증거를 더한다. 확률은 log-odds로 누적하고 값은 일정 범위로 제한한다.
+          </p>
+          <p>
+            오래 다시 관측되지 않은 점유 증거는 감쇠해 움직이는 사람의 흔적이 영구 장애물로 남지 않게 한다.
+            경로계획 시 장애물은 기본 0.20m만큼 팽창한다.
+          </p>
+        </article>
+
+        <article class="step">
+          <h3>Frontier 기반 미지 영역 탐색</h3>
+          <p>
+            free 셀이 unknown 셀과 맞닿아 있으면 frontier로 분류한다. 인접 frontier를 component로 묶고,
+            정보 획득량과 실제 A* 이동 비용을 함께 평가해 다음 탐색 목표를 선택한다.
+          </p>
+          <pre><code>frontier score = information gain × weight - path cost × weight</code></pre>
+        </article>
+
+        <article class="step">
+          <h3>A* 전역 경로계획</h3>
+          <p>
+            8방향 A*를 사용한다. 팽창 장애물과 unknown 셀은 통과하지 않고 대각선 corner cutting도 금지한다.
+            생성된 격자 경로는 line-of-sight 검사로 단순화한다.
+          </p>
+        </article>
+
+        <article class="step">
+          <h3>RGB + LiDAR 표적 인식</h3>
+          <p>카메라의 BGRA 픽셀에서 다음 조건으로 빨간 표적 후보를 추출한다.</p>
+          <pre><code>red &gt; 135
+red &gt; green × 1.55
+red &gt; blue × 1.55
+red - green &gt; 55</code></pre>
+          <p>
+            연결 성분의 중심으로 방위각을 구하고 알려진 표적 높이 0.60m로 단안 거리를 계산한다.
+            같은 방위의 LiDAR 거리와 일치할 때만 두 값을 융합해 주변 장애물을 표적으로 오인하는 현상을 줄인다.
+          </p>
+          <p>전역 경로가 아직 생성되지 않은 경우에도 거리와 방위각에 따라 0.09~0.22m/s로 표적을 추종한다.</p>
+        </article>
+
+        <article class="step">
+          <h3>명시적 미션 상태기계</h3>
+          <pre><code>BOOTSTRAP → EXPLORE → TARGET_APPROACH
+          → CONFIRM_TARGET → RETURN_HOME → COMPLETE</code></pre>
+          <p>
+            표적이 연속 4프레임 이상 안정적으로 보이면 접근을 시작한다. 표적 거리 0.95m 부근에서 정지해
+            1.2초 동안 확인한 뒤 출발점으로 복귀한다. 움직이지 못하면 임시 <code>RECOVERY</code> 상태로 전환된다.
+          </p>
+        </article>
+
+        <article class="step">
+          <h3>DWA 지역 경로계획</h3>
+          <p>
+            현재 속도와 가속도 제한 안에서 여러 선속도·각속도 조합을 만들고 각 후보 궤적을 1.35초간 예측한다.
+            목적지 진전, heading, 장애물 여유, 경로 거리, 속도와 회전량을 함께 평가한다.
+          </p>
+          <p>
+            예측 궤적이 <code>robot_radius + safety_margin</code> 이내로 장애물에 접근하거나 현재 속도로
+            제동할 수 없으면 해당 후보는 즉시 폐기된다.
+          </p>
+        </article>
+
+        <article class="step">
+          <h3>독립 안전검사와 모터 출력</h3>
+          <p>
+            DWA가 만든 명령도 마지막 안전 계층을 통과해야 한다. 전방 ±42°에서는 속도 비례 TTC 정지거리를,
+            측후방을 포함한 360°에서는 근접 이탈 검사를 적용한다.
+          </p>
+          <pre><code>stopping distance = robot radius
+                  + hard-stop distance
+                  + forward speed × TTC horizon</code></pre>
+          <p>
+            장애물이 정지거리 안에 있으면 명령을 덮어쓰고 더 넓은 방향으로 회전한다. 3초간 제어 명령이
+            있었지만 3.5cm 미만으로 이동하면 후진·회전 recovery를 수행한다.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="run">
+      <h2>4. 설치 및 실행</h2>
+      <h3>4.1 NumPy 설치</h3>
+      <p>Webots가 실제로 사용하는 Python 인터프리터에 NumPy를 설치해야 한다.</p>
+      <pre><code>Set-Location 'C:\Users\kmwook\git\tech_week_amr'
+py -3.10 -m pip install -r .\requirements.txt</code></pre>
+
+      <h3>4.2 단위 테스트</h3>
+      <pre><code>Set-Location 'C:\Users\kmwook\git\tech_week_amr'
+py -3.10 -B -m unittest discover -s tests -v</code></pre>
+      <div class="success"><strong>현재 확인 결과:</strong> 9개 테스트 모두 통과. 3인 동적 장애물 전체 미션도 PASS.</div>
+
+      <h3>4.3 Webots GUI 실행</h3>
+      <ol>
+        <li>Webots 실행</li>
+        <li><strong>File → Open World</strong></li>
+        <li><code>C:\Users\kmwook\git\tech_week_amr\worlds\amr_search_rescue.wbt</code> 선택</li>
+        <li>Reset 후 재생 버튼 실행</li>
+      </ol>
+
+      <h3>4.4 명령행 실행</h3>
+      <pre><code>Set-Location 'C:\Users\kmwook\git\tech_week_amr'
+
+&amp; 'C:\Program Files\Webots\msys64\mingw64\bin\webots.exe' `
+  --batch --mode=fast --stdout --stderr `
+  '.\worlds\amr_search_rescue.wbt'</code></pre>
+
+      <h3>4.5 정상 로그 순서</h3>
+      <pre><code>[MISSION] autonomous stack online
+[MISSION] BOOTSTRAP -&gt; EXPLORE
+[MISSION] EXPLORE -&gt; TARGET_APPROACH
+[MISSION] TARGET_APPROACH -&gt; CONFIRM_TARGET
+[MISSION] CONFIRM_TARGET -&gt; RETURN_HOME
+[MISSION] RETURN_HOME -&gt; COMPLETE
+EVALUATION: PASS</code></pre>
+    </section>
+
+    <section class="section" id="integration">
+      <h2>5. 해커톤 공식 월드 통합</h2>
+      <ol>
+        <li>주최 측 월드는 덮어쓰지 않고 별도 복사본을 만든다.</li>
+        <li><code>controllers/amr_search_rescue/</code> 폴더 전체를 공식 프로젝트의 <code>controllers</code> 아래에 복사한다.</li>
+        <li>주최 측 Robot 노드의 <code>controller</code> 필드를 <code>amr_search_rescue</code>로 설정한다.</li>
+        <li>주최 측 Robot의 장치 이름과 컨트롤러의 <code>getDevice()</code> 이름을 일치시킨다.</li>
+        <li>로봇의 바퀴 반경, 축간거리, 몸체 반경과 속도 제한을 <code>config.py</code>에 반영한다.</li>
+        <li>LiDAR와 카메라의 방향, FOV, 해상도, 측정 범위를 확인한다.</li>
+      </ol>
+
+      <table>
+        <thead><tr><th>현재 기대 장치</th><th>역할</th><th>필수 여부</th></tr></thead>
+        <tbody>
+          <tr><td><code>left/right wheel motor</code></td><td>차동구동 출력</td><td>필수</td></tr>
+          <tr><td><code>left/right wheel sensor</code></td><td>엔코더 오도메트리</td><td>필수</td></tr>
+          <tr><td><code>gyro</code></td><td>회전량 보조</td><td>필수</td></tr>
+          <tr><td><code>LDS-01</code></td><td>지도작성·위치보정·충돌방지</td><td>필수</td></tr>
+          <tr><td><code>camera</code></td><td>표적 인식</td><td>필수</td></tr>
+          <tr><td><code>map display</code></td><td>디버그 지도</td><td>선택</td></tr>
+          <tr><td><code>mission emitter</code></td><td>로컬 evaluator 상태 전송</td><td>선택</td></tr>
+        </tbody>
+      </table>
+
+      <div class="warning">
+        <strong>제출 주의:</strong> <code>mission_evaluator</code>는 로컬 시험용이다. 공식 규정에서 Supervisor를
+        허용하지 않으면 제출본에서 제거한다. <code>map display</code>와 <code>mission emitter</code>가 없는 공식 로봇을
+        사용할 때는 해당 장치를 추가하거나 컨트롤러를 선택적 장치 방식으로 수정해야 한다.
+      </div>
+    </section>
+
+    <section class="section" id="tuning">
+      <h2>6. 현장 튜닝 순서</h2>
+      <p>센서와 물리치수에서 시작해 안전 계층으로 진행한다. 뒤쪽 알고리즘으로 앞쪽 오차를 보상하지 않는다.</p>
+
+      <h3>6.1 로봇 물리치수</h3>
+      <table>
+        <thead><tr><th>파라미터</th><th>현재값</th><th>의미</th></tr></thead>
+        <tbody>
+          <tr><td><code>wheel_radius</code></td><td>0.033m</td><td>엔코더 회전량을 이동거리로 변환</td></tr>
+          <tr><td><code>axle_length</code></td><td>0.160m</td><td>좌우 바퀴 중심 간 거리</td></tr>
+          <tr><td><code>robot_radius</code></td><td>0.115m</td><td>충돌 검사에 사용하는 몸체 반경</td></tr>
+          <tr><td><code>max_wheel_speed</code></td><td>9.00rad/s</td><td>사용할 최대 바퀴 속도</td></tr>
+          <tr><td><code>max_linear_speed</code></td><td>0.285m/s</td><td>DWA 최대 전진 속도</td></tr>
+        </tbody>
+      </table>
+      <pre><code>new wheel radius = old radius × actual distance / estimated distance</code></pre>
+
+      <h3>6.2 센서</h3>
+      <ul>
+        <li>LiDAR 해상도, FOV, 최소·최대 거리와 정면 방향 확인</li>
+        <li>카메라 FOV, 해상도, 전방 방향과 BGRA 포맷 확인</li>
+        <li>지도가 좌우 반전되면 LiDAR 각도 배열의 부호 또는 센서 rotation 확인</li>
+      </ul>
+
+      <h3>6.3 지도</h3>
+      <ul>
+        <li>경기장이 14×14m보다 크면 <code>MapConfig.size</code> 증가</li>
+        <li>더 세밀한 지도가 필요하면 <code>resolution</code> 감소</li>
+        <li>resolution을 줄이면 A* 연산량과 메모리 사용량이 증가</li>
+      </ul>
+
+      <h3>6.4 표적</h3>
+      <ul>
+        <li>표적 색이 다르면 RGB mask 변경</li>
+        <li>표적 높이가 다르면 단안 거리식의 0.60m 변경</li>
+        <li>0.5m, 1m, 2m에서 실제 거리와 <code>target_range</code> 비교</li>
+        <li>오검출 시 색상 기준과 <code>target_stable_frames</code> 강화</li>
+      </ul>
+
+      <h3>6.5 계획과 안전</h3>
+      <table>
+        <thead><tr><th>증상</th><th>조정 방향</th></tr></thead>
+        <tbody>
+          <tr><td>장애물에 너무 접근</td><td><code>inflation_radius</code>, <code>safety_margin</code>, <code>ttc_horizon</code> 증가</td></tr>
+          <tr><td>좁은 통로 진입 불가</td><td><code>inflation_radius</code>를 조금 감소</td></tr>
+          <tr><td>속도가 지나치게 빠름</td><td><code>max_linear_speed</code>, <code>max_linear_accel</code> 감소</td></tr>
+          <tr><td>회전이 심하게 출렁임</td><td>최대 각속도 감소 또는 DWA 회전 페널티 증가</td></tr>
+          <tr><td>움직이는 사람의 흔적이 오래 남음</td><td><code>stale_hit_steps</code> 또는 <code>stale_decay</code> 감소</td></tr>
+          <tr><td>복도에서 위치가 점프</td><td>scan matching improvement gate 증가</td></tr>
+          <tr><td>scan matching이 거의 거절됨</td><td>gate를 조금 낮추고 반복 복도 점프 여부 재검사</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="section" id="test-plan">
+      <h2>7. 해커톤 현장 시험 순서</h2>
+      <ol class="checklist">
+        <li>바퀴를 띄우고 좌우 모터의 부호와 회전 방향 확인</li>
+        <li>1m 직진 후 실제 거리와 추정거리 비교</li>
+        <li>제자리 360도 회전 후 실제 각도와 추정각 비교</li>
+        <li><code>BOOTSTRAP</code>만 실행해 표시 지도와 실제 벽 형상 비교</li>
+        <li>정적 장애물 앞에서 <code>hard safety override</code> 확인</li>
+        <li>표적만 놓고 <code>target_confidence</code>와 <code>target_range</code> 확인</li>
+        <li>좁은 통로에서 A* 경로와 DWA 궤적 시험</li>
+        <li>사람이 횡단할 때 정지 또는 회피 동작 확인</li>
+        <li>표적 도달 후 출발점 복귀 확인</li>
+        <li>시작 방향과 표적 위치를 바꿔 최소 5회 반복</li>
+      </ol>
+      <div class="note">
+        실패하면 여러 파라미터를 동시에 수정하지 않는다. <strong>위치추정 → 지도 → 인식 → 전역계획 → 지역제어 → 안전</strong>
+        순서로 한 계층씩 확인한다.
+      </div>
+    </section>
+
+    <section class="section" id="troubleshooting">
+      <h2>8. 증상별 빠른 대응</h2>
+      <div class="grid-2">
+        <article class="mini">
+          <h3>컨트롤러가 즉시 종료</h3>
+          <p>NumPy 설치 여부와 <code>getDevice()</code> 장치 이름을 확인한다. Display나 Emitter가 없는지도 확인한다.</p>
+        </article>
+        <article class="mini">
+          <h3>계속 제자리 회전</h3>
+          <p>frontier가 생성되지 않거나 경로가 모두 막힌 상태다. LiDAR 방향, free threshold와 장애물 팽창 반경을 확인한다.</p>
+        </article>
+        <article class="mini">
+          <h3>표적을 찾지 못함</h3>
+          <p>카메라 방향과 BGRA 채널 순서, RGB threshold, 표적 픽셀 크기와 조명을 확인한다.</p>
+        </article>
+        <article class="mini">
+          <h3>빨간 물체를 오검출</h3>
+          <p>색상 비율 조건을 강화하고 최소 component 크기와 안정 프레임 수를 늘린다.</p>
+        </article>
+        <article class="mini">
+          <h3>복귀 위치가 틀림</h3>
+          <p>바퀴 반경과 축간거리부터 재보정한 뒤 scan matching 채택 횟수와 점수를 확인한다.</p>
+        </article>
+        <article class="mini">
+          <h3>Recovery가 반복됨</h3>
+          <p>통로가 팽창 장애물에 의해 막혔는지 확인하고 속도, inflation과 stuck 기준을 함께 검토한다.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="limits">
+      <h2>9. 현재 구현의 한계와 확장 방향</h2>
+      <ul>
+        <li>움직이는 사람을 의미적으로 분류하지 않고 LiDAR 동적 장애물로 회피한다.</li>
+        <li>표적 인식은 밝은 빨간색과 높이 0.60m라는 사전 특징에 맞춰져 있다.</li>
+        <li>지도 크기는 고정이며 자동 확장되지 않는다.</li>
+        <li>대규모 pose graph optimization과 loop closure는 포함하지 않는다.</li>
+        <li>Display와 Emitter가 없는 공식 로봇을 위한 선택적 장치 처리가 필요할 수 있다.</li>
+      </ul>
+      <p>
+        공식 월드나 Robot PROTO를 받은 뒤 가장 먼저 확인할 것은 <strong>장치 이름, 로봇 치수, 표적 특징,
+        경기장 크기</strong>다. 이 네 가지를 확정한 후에 계획·안전 파라미터를 튜닝해야 한다.
+      </p>
+    </section>
+
+    <footer class="footer">
+      TECH WEEK AMR · Architecture and Field Operations Guide · 2026-09-28
+    </footer>
+  </main>
+</body>
+</html>
