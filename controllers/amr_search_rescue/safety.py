@@ -14,6 +14,7 @@ from models import (
     DynamicObstacle,
     LaserScan,
     Pose2D,
+    Velocity,
     angle_difference,
     transform_points,
 )
@@ -37,6 +38,229 @@ class SafetySupervisor:
         self.last_override_reason = ""
         self.hazard_track_ids: set[int] = set()
         self.hazard_hold_until = -math.inf
+        self._previous_scan_ranges: np.ndarray | None = None
+        self._previous_scan_time: float | None = None
+        self._pretrack_candidate_streak = 0
+        self._previous_pretrack_candidates: np.ndarray | None = None
+        self._active_release_dwell = dynamic_config.release_dwell
+        self._front_escape_active = False
+        self._front_escape_direction = 0.0
+        self._front_escape_started = -math.inf
+        self._front_stop_latched = False
+        self._front_stop_episode_count = 0
+        self._front_stop_first_episode = -math.inf
+        self._front_stop_last_episode = -math.inf
+        self._front_stop_anchor: tuple[float, float] | None = None
+
+    def _register_front_stop_episode(self, pose: Pose2D, now: float) -> bool:
+        """Recognise a persistent front-stop loop in one small map region."""
+        if not self._front_stop_latched:
+            outside_time_window = (
+                now - self._front_stop_last_episode
+                > self.config.front_escape_episode_window
+            )
+            outside_anchor = (
+                self._front_stop_anchor is None
+                or math.hypot(
+                    pose.x - self._front_stop_anchor[0],
+                    pose.y - self._front_stop_anchor[1],
+                )
+                > self.config.front_escape_anchor_radius
+            )
+            if outside_time_window or outside_anchor:
+                self._front_stop_episode_count = 0
+                self._front_stop_first_episode = now
+                self._front_stop_anchor = (pose.x, pose.y)
+            self._front_stop_episode_count += 1
+            self._front_stop_last_episode = now
+            self._front_stop_latched = True
+        return (
+            self._front_stop_episode_count
+            >= self.config.front_escape_activation_episodes
+            and now - self._front_stop_first_episode
+            >= self.config.front_escape_activation_time
+        )
+
+    def _start_front_escape(self, scan: LaserScan, now: float) -> None:
+        """Latch the turn direction with the greater near-side clearance."""
+        ranges = np.asarray(scan.ranges, dtype=np.float32)
+        usable_ranges = np.where(
+            np.isfinite(ranges),
+            np.clip(ranges, 0.0, scan.max_range),
+            scan.max_range,
+        )
+        side_inner = math.radians(20.0)
+        side_outer = math.radians(105.0)
+        left = (scan.angles >= side_inner) & (scan.angles <= side_outer)
+        right = (scan.angles <= -side_inner) & (scan.angles >= -side_outer)
+
+        def clearance_score(mask: np.ndarray) -> float:
+            if not np.any(mask):
+                return 0.0
+            # A low percentile favours a genuinely open side rather than one
+            # distant ray through a narrow gap.
+            return float(np.percentile(usable_ranges[mask], 25.0))
+
+        left_score = clearance_score(left)
+        right_score = clearance_score(right)
+        self._front_escape_direction = 1.0 if left_score >= right_score else -1.0
+        self._front_escape_started = now
+        self._front_escape_active = True
+
+    def _front_escape_command(self) -> ControlCommand:
+        return ControlCommand(
+            0.0,
+            self._front_escape_direction * self.config.front_escape_angular_speed,
+            "front escape turn",
+        )
+
+    def _pretrack_closing_emergency(
+        self,
+        scan: LaserScan,
+        velocity: Velocity,
+        now: float,
+    ) -> bool:
+        """Detect a compact untracked object closing across adjacent beams.
+
+        The expected range reduction from ego translation is removed so a
+        wall approached at the commanded speed is left to the static planner.
+        Rapid rotation invalidates same-beam temporal correspondence, so that
+        frame only refreshes the baseline.
+        """
+        previous_ranges = self._previous_scan_ranges
+        previous_time = self._previous_scan_time
+        current_ranges = np.asarray(scan.ranges, dtype=np.float32)
+        self._previous_scan_ranges = current_ranges.copy()
+        self._previous_scan_time = now
+
+        if previous_ranges is None or previous_time is None:
+            self._pretrack_candidate_streak = 0
+            self._previous_pretrack_candidates = None
+            return False
+        if previous_ranges.shape != current_ranges.shape:
+            self._pretrack_candidate_streak = 0
+            self._previous_pretrack_candidates = None
+            return False
+        elapsed = now - previous_time
+        if elapsed <= 1e-6 or elapsed > self.config.pretrack_max_interval:
+            self._pretrack_candidate_streak = 0
+            self._previous_pretrack_candidates = None
+            return False
+        if abs(velocity.angular) > self.config.pretrack_max_angular_speed:
+            self._pretrack_candidate_streak = 0
+            self._previous_pretrack_candidates = None
+            return False
+
+        current_valid = scan.valid_mask(include_max_range=False)
+        previous_valid = (
+            np.isfinite(previous_ranges)
+            & (previous_ranges >= scan.min_range)
+            & (previous_ranges < scan.max_range * 0.985)
+        )
+        comparable = current_valid & previous_valid
+        measured_closing = np.zeros_like(current_ranges)
+        measured_closing[comparable] = (
+            previous_ranges[comparable] - current_ranges[comparable]
+        ) / elapsed
+        ego_closing = velocity.linear * np.cos(scan.angles)
+        residual_closing = measured_closing - ego_closing
+        candidates = (
+            comparable
+            & (current_ranges < self.config.pretrack_surface_distance)
+            & (residual_closing > self.config.pretrack_closing_speed)
+            & (residual_closing < self.config.pretrack_max_closing_speed)
+        )
+        if not np.any(candidates):
+            self._pretrack_candidate_streak = 0
+            self._previous_pretrack_candidates = None
+            return False
+
+        run = 0
+        longest_run = 0
+        for candidate in candidates:
+            if candidate:
+                run += 1
+                longest_run = max(longest_run, run)
+            else:
+                run = 0
+        # The scan wraps at +/- pi, so a rear object can occupy both ends.
+        if candidates[0] and candidates[-1]:
+            leading = 0
+            for candidate in candidates:
+                if not candidate:
+                    break
+                leading += 1
+            trailing = 0
+            for candidate in candidates[::-1]:
+                if not candidate:
+                    break
+                trailing += 1
+            longest_run = max(longest_run, leading + trailing)
+        if longest_run < self.config.pretrack_min_points:
+            self._pretrack_candidate_streak = 0
+            self._previous_pretrack_candidates = None
+            return False
+
+        previous_candidates = self._previous_pretrack_candidates
+        self._previous_pretrack_candidates = candidates.copy()
+        spatially_consistent = False
+        if previous_candidates is not None:
+            expanded_previous = previous_candidates.copy()
+            for offset in (1, 2):
+                expanded_previous |= np.roll(previous_candidates, offset)
+                expanded_previous |= np.roll(previous_candidates, -offset)
+            spatially_consistent = bool(np.any(candidates & expanded_previous))
+        self._pretrack_candidate_streak = (
+            self._pretrack_candidate_streak + 1 if spatially_consistent else 1
+        )
+        return (
+            self._pretrack_candidate_streak
+            >= self.config.pretrack_confirmation_frames
+        )
+
+    @staticmethod
+    def _track_kinematics(
+        pose: Pose2D,
+        command: ControlCommand,
+        obstacle: DynamicObstacle,
+        now: float,
+    ) -> Tuple[float, float]:
+        """Return current separation and radial closing speed for a track."""
+        unseen = max(0.0, now - obstacle.last_seen)
+        obstacle_x, obstacle_y = obstacle.predicted_position(unseen)
+        relative_x = obstacle_x - pose.x
+        relative_y = obstacle_y - pose.y
+        distance = math.hypot(relative_x, relative_y)
+        if distance <= 1e-6:
+            return distance, math.inf
+        robot_vx = command.linear * math.cos(pose.theta)
+        robot_vy = command.linear * math.sin(pose.theta)
+        separation_rate = (
+            relative_x * (obstacle.vx - robot_vx)
+            + relative_y * (obstacle.vy - robot_vy)
+        ) / distance
+        return distance, -separation_rate
+
+    def _proximity_hazards(
+        self,
+        pose: Pose2D,
+        command: ControlCommand,
+        obstacles: Tuple[DynamicObstacle, ...],
+        now: float,
+    ) -> Tuple[DynamicObstacle, ...]:
+        """Nearby tracks whose surface is closing on the robot."""
+        hazards = []
+        for obstacle in obstacles:
+            distance, closing_speed = self._track_kinematics(
+                pose, command, obstacle, now
+            )
+            surface_distance = distance - obstacle.radius
+            if (
+                surface_distance < self.config.emergency_surface_distance
+                and closing_speed > self.dynamic_config.hazard_closing_speed
+            ):
+                hazards.append(obstacle)
+        return tuple(hazards)
 
     def _suspend_stuck_tracking(self) -> None:
         """Discard motion history while safety intentionally owns the command.
@@ -65,9 +289,7 @@ class SafetySupervisor:
                 )
         recovery_config = replace(
             self.dynamic_config,
-            safety_margin=0.02,
-            uncertainty_rate=min(0.025, self.dynamic_config.uncertainty_rate),
-            missed_uncertainty_rate=min(0.10, self.dynamic_config.missed_uncertainty_rate),
+            safety_margin=self.dynamic_config.evasive_safety_margin,
         )
         safe_candidates = []
         for candidate in candidates:
@@ -132,7 +354,9 @@ class SafetySupervisor:
         pose: Pose2D,
         dynamic_obstacles: Tuple[DynamicObstacle, ...],
         now: float,
+        current_velocity: Velocity | None = None,
     ) -> ControlCommand:
+        current_velocity = current_velocity or Velocity(command.linear, command.angular)
         finite = scan.valid_mask(include_max_range=False)
         closest_distance = float(np.min(scan.ranges[finite])) if np.any(finite) else math.inf
         front = finite & (np.abs(scan.angles) < math.radians(42.0))
@@ -152,49 +376,92 @@ class SafetySupervisor:
         )
         self.last_min_clearance = prediction.min_clearance
         self.last_ttc = prediction.ttc
-        compact_nearby = any(
-            math.hypot(pose.x - obstacle.x, pose.y - obstacle.y)
-            < self.robot.robot_radius + obstacle.radius + 0.70
-            for obstacle in dynamic_obstacles
+        proximity_hazards = self._proximity_hazards(
+            pose, command, dynamic_obstacles, now
         )
-        proximity_threshold = (
-            self.config.emergency_surface_distance
-            if compact_nearby
-            else self.robot.robot_radius + 0.08
+        pretrack_emergency = self._pretrack_closing_emergency(
+            scan, current_velocity, now
         )
-        raw_emergency = closest_distance < proximity_threshold
+        # Keep a very small all-around hard-contact envelope for untracked
+        # objects.  The wider 360-degree envelope is only justified by a
+        # nearby dynamic track that is actually closing; previously any
+        # compact track enlarged the threshold for every LiDAR return,
+        # including side walls and people already moving away.
+        contact_emergency = closest_distance < self.robot.robot_radius + 0.08
+        raw_emergency = contact_emergency or bool(proximity_hazards)
         front_emergency = front_distance < stopping_distance
         dynamic_emergency = prediction.ttc is not None
-        danger = raw_emergency or front_emergency or dynamic_emergency
+        danger = raw_emergency or pretrack_emergency or front_emergency or dynamic_emergency
 
         if danger:
             self.override_active = True
             self.safe_since = None
-            self._suspend_stuck_tracking()
-            for obstacle in dynamic_obstacles:
-                distance = math.hypot(pose.x - obstacle.x, pose.y - obstacle.y)
-                release_distance = (
-                    self.robot.robot_radius
-                    + obstacle.radius
-                    + self.dynamic_config.safety_margin
-                    + self.dynamic_config.hazard_release_margin
-                )
-                if distance < release_distance + 0.35:
-                    self.hazard_track_ids.add(obstacle.track_id)
-            self.hazard_hold_until = max(
-                self.hazard_hold_until,
-                now + self.dynamic_config.lost_track_hold,
+            pretrack_only = pretrack_emergency and not (
+                raw_emergency or front_emergency or dynamic_emergency
             )
+            front_only = front_emergency and not (
+                raw_emergency or pretrack_emergency or dynamic_emergency
+            )
+            front_escape_ready = (
+                self._register_front_stop_episode(pose, now) if front_only else False
+            )
+            if not front_only:
+                self._front_stop_latched = False
+                self._front_stop_episode_count = 0
+                self._front_stop_first_episode = -math.inf
+                self._front_stop_anchor = None
+            self._active_release_dwell = (
+                self.config.pretrack_release_dwell
+                if pretrack_only
+                else (
+                    self.config.front_escape_release_dwell
+                    if front_escape_ready
+                    else self.dynamic_config.release_dwell
+                )
+            )
+            self._suspend_stuck_tracking()
+            tracked_dangers = {obstacle.track_id for obstacle in proximity_hazards}
+            if dynamic_emergency:
+                for obstacle in dynamic_obstacles:
+                    obstacle_prediction = predict_dynamic_clearance(
+                        pose,
+                        command,
+                        (obstacle,),
+                        self.robot,
+                        self.dynamic_config,
+                        now,
+                    )
+                    if obstacle_prediction.ttc is not None:
+                        tracked_dangers.add(obstacle.track_id)
+            if tracked_dangers:
+                self.hazard_track_ids.update(tracked_dangers)
+                self.hazard_hold_until = max(
+                    self.hazard_hold_until,
+                    now + self.dynamic_config.lost_track_hold,
+                )
             reasons = []
             if dynamic_emergency:
                 reasons.append("dynamic TTC")
             if raw_emergency:
                 reasons.append("360 proximity")
+            if pretrack_emergency:
+                reasons.append("pretrack closing")
             if front_emergency:
                 reasons.append("front stop")
             self.last_override_reason = "+".join(reasons)
+            if pretrack_only:
+                self._front_escape_active = False
+                return ControlCommand(0.0, 0.0, "pretrack safety stop")
+            if front_escape_ready:
+                if not self._front_escape_active:
+                    self._start_front_escape(scan, now)
+                if now - self._front_escape_started <= self.config.front_escape_max_duration:
+                    return self._front_escape_command()
+            else:
+                self._front_escape_active = False
             return self._evasive_command(pose, scan, dynamic_obstacles, now)
 
+        self._front_stop_latched = False
         if self.override_active:
             self._suspend_stuck_tracking()
             tracked_hazards = tuple(
@@ -202,28 +469,56 @@ class SafetySupervisor:
                 for obstacle in dynamic_obstacles
                 if obstacle.track_id in self.hazard_track_ids
             )
-            near_hazard = any(
-                math.hypot(pose.x - obstacle.x, pose.y - obstacle.y)
-                < (
+            near_hazard = False
+            for obstacle in tracked_hazards:
+                distance, closing_speed = self._track_kinematics(
+                    pose, command, obstacle, now
+                )
+                if (
+                    distance
+                    < (
                     self.robot.robot_radius
                     + obstacle.radius
                     + self.dynamic_config.safety_margin
                     + self.dynamic_config.hazard_release_margin
                 )
-                for obstacle in tracked_hazards
-            )
-            if near_hazard or now < self.hazard_hold_until:
+                    and closing_speed
+                    > -self.dynamic_config.hazard_receding_release_speed
+                ):
+                    near_hazard = True
+                    break
+            visible_ids = {obstacle.track_id for obstacle in tracked_hazards}
+            missing_hazard = bool(self.hazard_track_ids - visible_ids)
+            if near_hazard or (missing_hazard and now < self.hazard_hold_until):
+                self._front_escape_active = False
                 self.safe_since = None
                 self.last_override_reason = "tracked hazard yield"
                 return self._evasive_command(pose, scan, tracked_hazards, now)
+            if self._front_escape_active:
+                escape_elapsed = now - self._front_escape_started
+                release_distance = (
+                    stopping_distance + self.config.front_escape_clearance_margin
+                )
+                if (
+                    escape_elapsed < self.config.front_escape_min_duration
+                    or front_distance < release_distance
+                ):
+                    self.last_override_reason = "front escape turn"
+                    return self._front_escape_command()
+                self._front_escape_active = False
+                self._front_stop_episode_count = 0
+                self._front_stop_first_episode = -math.inf
+                self._front_stop_anchor = None
+                self.safe_since = now
             if self.safe_since is None:
                 self.safe_since = now
-            if now - self.safe_since < self.dynamic_config.release_dwell:
+            if now - self.safe_since < self._active_release_dwell:
                 self.last_override_reason = "safety release dwell"
                 return ControlCommand(0.0, 0.0, "safety release dwell")
             self.override_active = False
             self.safe_since = None
             self.hazard_track_ids.clear()
+            self._front_escape_active = False
         self.last_override_reason = ""
         return command
 
@@ -233,7 +528,13 @@ class SafetySupervisor:
         # a fresh stuck window only after the nominal controller regains
         # ownership.
         if self.override_active or command.reason.startswith(
-            ("predictive safety", "predictive evasive", "safety release", "tracked hazard")
+            (
+                "predictive safety",
+                "predictive evasive",
+                "safety release",
+                "tracked hazard",
+                "front escape",
+            )
         ):
             self._suspend_stuck_tracking()
             return False

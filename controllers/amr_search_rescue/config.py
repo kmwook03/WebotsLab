@@ -67,6 +67,25 @@ class PlannerConfig:
     dwa_dt: float = 0.15
     dwa_linear_samples: int = 6
     dwa_angular_samples: int = 13
+    return_direct_approach_distance: float = 1.80
+    return_endpoint_error: float = 0.35
+    return_detour_waypoint_distance: float = 0.70
+    return_detour_min_travel: float = 0.30
+    return_detour_duration: float = 5.0
+    return_detour_reached_distance: float = 0.20
+    return_detour_corridor_half_angle_deg: float = 12.0
+    return_detour_max_turn_deg: float = 110.0
+    breadcrumb_spacing: float = 0.20
+    breadcrumb_loop_rejoin_distance: float = 0.32
+    breadcrumb_loop_guard_points: int = 3
+    breadcrumb_lookahead: float = 0.65
+    breadcrumb_max_path_stretch: float = 2.5
+    breadcrumb_path_slack: float = 0.50
+    breadcrumb_reached_distance: float = 0.20
+    breadcrumb_stall_progress: float = 0.08
+    breadcrumb_stall_active_time: float = 4.0
+    breadcrumb_revisit_radius: float = 0.42
+    breadcrumb_recent_exclusion: int = 4
 
 
 @dataclass(frozen=True)
@@ -91,6 +110,9 @@ class DynamicObstacleConfig:
     missed_uncertainty_rate: float = 0.20
     release_dwell: float = 0.50
     hazard_release_margin: float = 0.35
+    hazard_closing_speed: float = 0.04
+    hazard_receding_release_speed: float = 0.06
+    evasive_safety_margin: float = 0.075
     lost_track_hold: float = 1.00
 
 
@@ -120,6 +142,23 @@ class SafetyConfig:
     stuck_distance: float = 0.035
     recovery_duration: float = 1.8
     emergency_surface_distance: float = 0.42
+    pretrack_surface_distance: float = 0.55
+    pretrack_closing_speed: float = 0.22
+    pretrack_max_closing_speed: float = 1.20
+    pretrack_min_points: int = 3
+    pretrack_confirmation_frames: int = 2
+    pretrack_max_angular_speed: float = 0.12
+    pretrack_max_interval: float = 0.20
+    pretrack_release_dwell: float = 0.18
+    front_escape_angular_speed: float = 0.72
+    front_escape_min_duration: float = 0.35
+    front_escape_max_duration: float = 1.80
+    front_escape_clearance_margin: float = 0.10
+    front_escape_release_dwell: float = 0.12
+    front_escape_activation_episodes: int = 3
+    front_escape_activation_time: float = 5.0
+    front_escape_episode_window: float = 8.0
+    front_escape_anchor_radius: float = 0.20
 
 
 @dataclass(frozen=True)

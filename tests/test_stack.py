@@ -16,7 +16,7 @@ from localization import PoseEstimator  # noqa: E402
 from mission import MissionManager  # noqa: E402
 from models import ControlCommand, DynamicObstacle, LaserScan, MissionPhase, Pose2D, TargetDetection, Velocity, wrap_angle  # noqa: E402
 from perception import RedTargetDetector  # noqa: E402
-from planning import AStarPlanner, DynamicWindowPlanner, FrontierExplorer  # noqa: E402
+from planning import AStarPlanner, DynamicWindowPlanner, FrontierExplorer, WaypointProgressMonitor, append_breadcrumb, breadcrumb_return_cost, choose_local_detour, reverse_breadcrumb_segment, terminal_approach_path  # noqa: E402
 from safety import SafetySupervisor  # noqa: E402
 from tracking import DynamicObstacleTracker  # noqa: E402
 
@@ -77,6 +77,207 @@ class GlobalPlanningTests(unittest.TestCase):
 
 
 class LocalPlanningTests(unittest.TestCase):
+    def test_breadcrumbs_ignore_jitter_and_return_in_reverse_order(self):
+        trail = []
+        self.assertTrue(append_breadcrumb(trail, Pose2D(0.0, 0.0), 0.20))
+        self.assertFalse(append_breadcrumb(trail, Pose2D(0.08, 0.02), 0.20))
+        self.assertTrue(append_breadcrumb(trail, Pose2D(0.25, 0.0), 0.20))
+        self.assertTrue(append_breadcrumb(trail, Pose2D(0.50, 0.15), 0.20))
+        self.assertTrue(append_breadcrumb(trail, Pose2D(0.75, 0.30), 0.20))
+
+        segment, target_index = reverse_breadcrumb_segment(
+            trail, Pose2D(0.78, 0.31), None, 0.55
+        )
+
+        self.assertEqual(target_index, 1)
+        self.assertEqual(segment[1:], [trail[2], trail[1]])
+
+    def test_breadcrumbs_erase_closed_route_loop(self):
+        trail = [(0.0, 0.0), (0.4, 0.0), (0.8, 0.0), (0.8, 0.4), (0.4, 0.4)]
+
+        changed = append_breadcrumb(
+            trail,
+            Pose2D(0.05, 0.04),
+            spacing=0.20,
+            loop_rejoin_distance=0.15,
+            loop_guard_points=2,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(trail, [(0.0, 0.0)])
+
+    def test_breadcrumb_stall_counts_only_active_control_time(self):
+        monitor = WaypointProgressMonitor(min_progress=0.08, timeout=1.0)
+        monitor.reset(1.0)
+
+        for _ in range(20):
+            self.assertFalse(monitor.update(0.98, 0.1, active=False))
+        for _ in range(9):
+            self.assertFalse(monitor.update(0.97, 0.1, active=True))
+        self.assertTrue(monitor.update(0.97, 0.1, active=True))
+        self.assertFalse(monitor.update(0.86, 0.1, active=True))
+
+    def test_breadcrumb_cost_exposes_excessive_remembered_detour(self):
+        trail = [(0.0, 0.0), (1.0, 0.0), (1.0, 2.0), (0.2, 2.0)]
+
+        cost = breadcrumb_return_cost(trail, Pose2D(0.2, 1.0))
+        direct = math.hypot(0.2, 1.0)
+
+        self.assertGreater(cost, 2.5 * direct + 0.5)
+
+    def test_home_detour_prefers_open_side_of_blocked_direct_corridor(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        ranges = np.full(360, 3.5, dtype=np.float32)
+        ranges[np.abs(angles) < math.radians(18.0)] = 0.35
+        ranges[(angles < 0.0) & (angles > math.radians(-100.0))] = 0.45
+        scan = LaserScan(ranges, angles, 0.05, 3.5)
+
+        waypoint = choose_local_detour(
+            Pose2D(),
+            (1.2, 0.0),
+            scan,
+            RobotConfig(),
+            0.70,
+            0.30,
+            math.radians(12.0),
+            math.radians(110.0),
+        )
+
+        self.assertIsNotNone(waypoint)
+        self.assertGreater(waypoint[1], 0.20)
+        self.assertGreater(waypoint[0], 0.0)
+
+    def test_home_detour_is_unused_when_direct_corridor_is_clear(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        scan = LaserScan(np.full(360, 3.5, dtype=np.float32), angles, 0.05, 3.5)
+
+        waypoint = choose_local_detour(
+            Pose2D(),
+            (1.2, 0.0),
+            scan,
+            RobotConfig(),
+            0.70,
+            0.30,
+            math.radians(12.0),
+            math.radians(110.0),
+        )
+
+        self.assertIsNone(waypoint)
+
+    def test_forced_home_detour_penalizes_previously_visited_side(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        ranges = np.full(360, 3.5, dtype=np.float32)
+        ranges[np.abs(angles) < math.radians(16.0)] = 0.35
+        scan = LaserScan(ranges, angles, 0.05, 3.5)
+        visited_upper = [(0.25, 0.30), (0.45, 0.48), (0.65, 0.58)]
+
+        waypoint = choose_local_detour(
+            Pose2D(),
+            (1.2, 0.0),
+            scan,
+            RobotConfig(),
+            0.70,
+            0.30,
+            math.radians(12.0),
+            math.radians(110.0),
+            visited_upper,
+            0.42,
+            True,
+        )
+
+        self.assertIsNotNone(waypoint)
+        self.assertLess(waypoint[1], -0.15)
+
+    def test_return_terminal_path_rejects_far_snapped_endpoint(self):
+        pose = Pose2D(0.96, 0.65, -0.19)
+
+        path, direct = terminal_approach_path(
+            [(0.96, 0.65)], pose, (0.0, 0.0), 1.80, 0.35
+        )
+
+        self.assertTrue(direct)
+        self.assertEqual(path[-1], (0.0, 0.0))
+
+    def test_return_terminal_path_preserves_valid_or_distant_global_path(self):
+        near_pose = Pose2D(0.96, 0.65)
+        valid_path = [(0.96, 0.65), (0.1, 0.1)]
+        preserved, near_direct = terminal_approach_path(
+            valid_path, near_pose, (0.0, 0.0), 1.80, 0.35
+        )
+        distant_path = [(3.0, 0.0), (1.0, 0.0)]
+        distant, far_direct = terminal_approach_path(
+            distant_path, Pose2D(3.0, 0.0), (0.0, 0.0), 1.80, 0.35
+        )
+
+        self.assertFalse(near_direct)
+        self.assertEqual(preserved, valid_path)
+        self.assertFalse(far_direct)
+        self.assertEqual(distant, distant_path)
+
+    def test_dwa_advances_after_direct_home_alignment(self):
+        robot = RobotConfig()
+        planner = DynamicWindowPlanner(robot, PlannerConfig(), DynamicObstacleConfig())
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        scan = LaserScan(np.full(360, np.inf, dtype=np.float32), angles, 0.05, 3.5)
+        pose = Pose2D(0.96, 0.65, -0.19)
+        velocity = Velocity()
+        initial_distance = math.hypot(pose.x, pose.y)
+        max_linear = 0.0
+
+        for index in range(120):
+            command = planner.command(
+                pose,
+                velocity,
+                [(pose.x, pose.y), (0.0, 0.0)],
+                scan,
+                0.032,
+                (),
+                index * 0.032,
+            )
+            velocity = Velocity(command.linear, command.angular)
+            pose.theta += command.angular * 0.032
+            pose.x += command.linear * math.cos(pose.theta) * 0.032
+            pose.y += command.linear * math.sin(pose.theta) * 0.032
+            max_linear = max(max_linear, command.linear)
+
+        self.assertGreater(max_linear, 0.10)
+        self.assertLess(math.hypot(pose.x, pose.y), initial_distance - 0.30)
+
+    def test_dwa_detour_endpoint_is_not_pulled_toward_home_early(self):
+        planner = DynamicWindowPlanner(
+            RobotConfig(), PlannerConfig(), DynamicObstacleConfig()
+        )
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        scan = LaserScan(
+            np.full(360, np.inf, dtype=np.float32), angles, 0.05, 3.5
+        )
+        pose = Pose2D(0.2, 0.2, math.pi / 4.0)
+        velocity = Velocity(0.12, 0.0)
+        waypoint = (0.5, 0.5)
+        home = (1.2, 0.0)
+
+        corner_cutting = planner.command(
+            pose,
+            velocity,
+            [(pose.x, pose.y), waypoint, home],
+            scan,
+            0.064,
+            (),
+            0.0,
+        )
+        local_goal = planner.command(
+            pose,
+            velocity,
+            [(pose.x, pose.y), waypoint],
+            scan,
+            0.064,
+            (),
+            0.0,
+        )
+
+        self.assertLess(corner_cutting.angular, -0.10)
+        self.assertGreater(local_goal.angular, -0.05)
+
     def test_dwa_rejects_collision_course(self):
         robot = RobotConfig()
         planner = DynamicWindowPlanner(robot, PlannerConfig(), DynamicObstacleConfig())
@@ -102,6 +303,324 @@ class LocalPlanningTests(unittest.TestCase):
 
         self.assertTrue(command.reason.startswith("predictive evasive"))
         self.assertNotEqual((command.linear, command.angular), (0.20, 0.0))
+
+    def test_front_stop_latches_turn_toward_clearer_side(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        ranges = np.full(360, 3.5, dtype=np.float32)
+        front = np.abs(angles) < math.radians(8.0)
+        right = (angles < math.radians(-20.0)) & (angles > math.radians(-105.0))
+        ranges[front] = 0.34
+        ranges[right] = 0.55
+        scan = LaserScan(ranges, angles, 0.05, 3.5)
+        supervisor = SafetySupervisor(RobotConfig(), SafetyConfig(), DynamicObstacleConfig())
+
+        initial = supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"), scan, Pose2D(), (), 0.0
+        )
+        supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"),
+            LaserScan(np.full(360, 3.5, dtype=np.float32), angles, 0.05, 3.5),
+            Pose2D(),
+            (),
+            0.1,
+        )
+        supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"), scan, Pose2D(), (), 3.0
+        )
+        supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"),
+            LaserScan(np.full(360, 3.5, dtype=np.float32), angles, 0.05, 3.5),
+            Pose2D(),
+            (),
+            3.1,
+        )
+        first = supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"), scan, Pose2D(), (), 6.0
+        )
+        second = supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"), scan, Pose2D(), (), 6.1
+        )
+
+        self.assertTrue(initial.reason.startswith("predictive"))
+        self.assertEqual(first.reason, "front escape turn")
+        self.assertEqual(second.reason, "front escape turn")
+        self.assertEqual(first.linear, 0.0)
+        self.assertGreater(first.angular, 0.0)
+        self.assertEqual(first.angular, second.angular)
+
+    def test_front_escape_turn_continues_before_short_release(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        blocked_ranges = np.full(360, 3.5, dtype=np.float32)
+        blocked_ranges[np.abs(angles) < math.radians(8.0)] = 0.34
+        blocked = LaserScan(blocked_ranges, angles, 0.05, 3.5)
+        clear = LaserScan(np.full(360, 3.5, dtype=np.float32), angles, 0.05, 3.5)
+        supervisor = SafetySupervisor(RobotConfig(), SafetyConfig(), DynamicObstacleConfig())
+        nominal = ControlCommand(0.20, 0.0, "test")
+
+        initial = supervisor.guard(nominal, blocked, Pose2D(), (), 0.0)
+        supervisor.guard(nominal, clear, Pose2D(), (), 0.1)
+        supervisor.guard(nominal, blocked, Pose2D(), (), 3.0)
+        supervisor.guard(nominal, clear, Pose2D(), (), 3.1)
+        first = supervisor.guard(nominal, blocked, Pose2D(), (), 6.0)
+        still_turning = supervisor.guard(nominal, clear, Pose2D(), (), 6.2)
+        dwell = supervisor.guard(nominal, clear, Pose2D(), (), 6.4)
+        released = supervisor.guard(nominal, clear, Pose2D(), (), 6.6)
+
+        self.assertTrue(initial.reason.startswith("predictive"))
+        self.assertEqual(first.reason, "front escape turn")
+        self.assertEqual(still_turning.reason, "front escape turn")
+        self.assertEqual(dwell.reason, "safety release dwell")
+        self.assertEqual(released.reason, "test")
+        self.assertFalse(supervisor.override_active)
+
+    def test_front_escape_does_not_activate_while_robot_changes_region(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        blocked_ranges = np.full(360, 3.5, dtype=np.float32)
+        blocked_ranges[np.abs(angles) < math.radians(8.0)] = 0.34
+        blocked = LaserScan(blocked_ranges, angles, 0.05, 3.5)
+        clear = LaserScan(np.full(360, 3.5, dtype=np.float32), angles, 0.05, 3.5)
+        supervisor = SafetySupervisor(RobotConfig(), SafetyConfig(), DynamicObstacleConfig())
+        nominal = ControlCommand(0.20, 0.0, "test")
+
+        commands = []
+        for now, x in ((0.0, 0.0), (3.0, 0.30), (6.0, 0.60)):
+            commands.append(supervisor.guard(nominal, blocked, Pose2D(x=x), (), now))
+            supervisor.guard(nominal, clear, Pose2D(x=x), (), now + 0.1)
+
+        self.assertTrue(
+            all(command.reason.startswith("predictive") for command in commands)
+        )
+        self.assertTrue(all(command.reason != "front escape turn" for command in commands))
+
+    def test_evasive_margin_rejects_tight_dynamic_escape(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        scan = LaserScan(np.full(360, np.inf, dtype=np.float32), angles, 0.05, 3.5)
+        obstacle = DynamicObstacle(1, 0.35, -0.20, -0.40, 0.0, 0.16, 1.0, 0.0)
+        loose = SafetySupervisor(
+            RobotConfig(),
+            SafetyConfig(),
+            DynamicObstacleConfig(evasive_safety_margin=0.02),
+        )
+        strict = SafetySupervisor(RobotConfig(), SafetyConfig(), DynamicObstacleConfig())
+
+        loose_command = loose._evasive_command(Pose2D(), scan, (obstacle,), 0.0)
+        strict_command = strict._evasive_command(Pose2D(), scan, (obstacle,), 0.0)
+
+        self.assertTrue(loose_command.reason.startswith("predictive evasive"))
+        self.assertEqual(strict_command.reason, "predictive safety stop")
+
+    def test_pretrack_layer_stops_for_compact_untracked_closing_object(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        side = int(np.argmin(np.abs(angles - math.pi / 2.0)))
+        previous_ranges = np.full(360, np.inf, dtype=np.float32)
+        current_ranges = np.full(360, np.inf, dtype=np.float32)
+        previous_ranges[side - 3:side + 4] = 0.60
+        current_ranges[side - 3:side + 4] = 0.52
+        supervisor = SafetySupervisor(RobotConfig(), SafetyConfig(), DynamicObstacleConfig())
+
+        first = supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"),
+            LaserScan(previous_ranges, angles, 0.05, 3.5),
+            Pose2D(),
+            (),
+            0.0,
+            Velocity(0.20, 0.0),
+        )
+        second = supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"),
+            LaserScan(current_ranges, angles, 0.05, 3.5),
+            Pose2D(),
+            (),
+            0.1,
+            Velocity(0.20, 0.0),
+        )
+        third = supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"),
+            LaserScan(
+                current_ranges - np.where(np.isfinite(current_ranges), 0.08, 0.0),
+                angles,
+                0.05,
+                3.5,
+            ),
+            Pose2D(),
+            (),
+            0.2,
+            Velocity(0.20, 0.0),
+        )
+
+        self.assertEqual(first.reason, "test")
+        self.assertEqual(second.reason, "test")
+        self.assertIn("pretrack closing", supervisor.last_override_reason)
+        self.assertEqual(third.reason, "pretrack safety stop")
+
+    def test_pretrack_confirmation_requires_same_angular_region(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        left = int(np.argmin(np.abs(angles - math.pi / 2.0)))
+        right = int(np.argmin(np.abs(angles + math.pi / 2.0)))
+        baseline = np.full(360, np.inf, dtype=np.float32)
+        first_change = baseline.copy()
+        second_change = baseline.copy()
+        baseline[left - 3:left + 4] = 0.60
+        first_change[left - 3:left + 4] = 0.52
+        first_change[right - 3:right + 4] = 0.60
+        second_change[left - 3:left + 4] = 0.52
+        second_change[right - 3:right + 4] = 0.52
+        supervisor = SafetySupervisor(RobotConfig(), SafetyConfig(), DynamicObstacleConfig())
+
+        commands = []
+        for now, ranges in ((0.0, baseline), (0.1, first_change), (0.2, second_change)):
+            commands.append(
+                supervisor.guard(
+                    ControlCommand(0.0, 0.0, "test"),
+                    LaserScan(ranges, angles, 0.05, 3.5),
+                    Pose2D(),
+                    (),
+                    now,
+                    Velocity(),
+                )
+            )
+
+        self.assertTrue(all(command.reason == "test" for command in commands))
+        self.assertFalse(supervisor.override_active)
+
+    def test_pretrack_layer_compensates_for_ego_approach_to_static_surface(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        front = int(np.argmin(np.abs(angles)))
+        previous_ranges = np.full(360, np.inf, dtype=np.float32)
+        current_ranges = np.full(360, np.inf, dtype=np.float32)
+        previous_ranges[front - 3:front + 4] = 0.60
+        current_ranges[front - 3:front + 4] = 0.58
+        supervisor = SafetySupervisor(RobotConfig(), SafetyConfig(), DynamicObstacleConfig())
+
+        supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"),
+            LaserScan(previous_ranges, angles, 0.05, 3.5),
+            Pose2D(),
+            (),
+            0.0,
+            Velocity(0.20, 0.0),
+        )
+        command = supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"),
+            LaserScan(current_ranges, angles, 0.05, 3.5),
+            Pose2D(),
+            (),
+            0.1,
+            Velocity(0.20, 0.0),
+        )
+
+        self.assertEqual(command.reason, "test")
+        self.assertFalse(supervisor.override_active)
+
+    def test_pretrack_layer_ignores_scan_change_during_rotation(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        side = int(np.argmin(np.abs(angles - math.pi / 2.0)))
+        previous_ranges = np.full(360, np.inf, dtype=np.float32)
+        current_ranges = np.full(360, np.inf, dtype=np.float32)
+        previous_ranges[side - 3:side + 4] = 0.60
+        current_ranges[side - 3:side + 4] = 0.52
+        supervisor = SafetySupervisor(RobotConfig(), SafetyConfig(), DynamicObstacleConfig())
+
+        supervisor.guard(
+            ControlCommand(0.0, 0.50, "test"),
+            LaserScan(previous_ranges, angles, 0.05, 3.5),
+            Pose2D(),
+            (),
+            0.0,
+            Velocity(0.0, 0.50),
+        )
+        command = supervisor.guard(
+            ControlCommand(0.0, 0.50, "test"),
+            LaserScan(current_ranges, angles, 0.05, 3.5),
+            Pose2D(),
+            (),
+            0.1,
+            Velocity(0.0, 0.50),
+        )
+
+        self.assertEqual(command.reason, "test")
+        self.assertFalse(supervisor.override_active)
+
+    def test_side_person_moving_away_does_not_trigger_360_proximity(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        ranges = np.full(360, np.inf, dtype=np.float32)
+        ranges[np.argmin(np.abs(angles - math.pi / 2.0))] = 0.30
+        scan = LaserScan(ranges, angles, 0.05, 3.5)
+        supervisor = SafetySupervisor(RobotConfig(), SafetyConfig(), DynamicObstacleConfig())
+        receding = DynamicObstacle(1, 0.0, 0.46, 0.0, 0.35, 0.16, 1.0, 0.0)
+
+        command = supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"), scan, Pose2D(), (receding,), 0.0
+        )
+
+        self.assertEqual(command.reason, "test")
+        self.assertFalse(supervisor.override_active)
+
+    def test_rear_person_moving_away_does_not_trigger_360_proximity(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        ranges = np.full(360, np.inf, dtype=np.float32)
+        ranges[np.argmin(np.abs(np.abs(angles) - math.pi))] = 0.30
+        scan = LaserScan(ranges, angles, 0.05, 3.5)
+        supervisor = SafetySupervisor(RobotConfig(), SafetyConfig(), DynamicObstacleConfig())
+        receding = DynamicObstacle(1, -0.46, 0.0, -0.35, 0.0, 0.16, 1.0, 0.0)
+
+        command = supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"), scan, Pose2D(), (receding,), 0.0
+        )
+
+        self.assertEqual(command.reason, "test")
+        self.assertFalse(supervisor.override_active)
+
+    def test_non_closing_side_and_rear_people_do_not_trigger_360_proximity(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        supervisor = SafetySupervisor(RobotConfig(), SafetyConfig(), DynamicObstacleConfig())
+
+        for track_id, x, y, bearing in (
+            (1, 0.0, 0.46, math.pi / 2.0),
+            (2, -0.46, 0.0, math.pi),
+        ):
+            with self.subTest(track_id=track_id):
+                ranges = np.full(360, np.inf, dtype=np.float32)
+                ranges[np.argmin(np.abs(np.abs(angles) - abs(bearing)))] = 0.30
+                scan = LaserScan(ranges, angles, 0.05, 3.5)
+                stationary = DynamicObstacle(
+                    track_id, x, y, 0.0, 0.0, 0.16, 1.0, 0.0
+                )
+
+                command = supervisor.guard(
+                    ControlCommand(0.20, 0.0, "test"),
+                    scan,
+                    Pose2D(),
+                    (stationary,),
+                    0.0,
+                )
+
+                self.assertEqual(command.reason, "test")
+                self.assertFalse(supervisor.override_active)
+
+    def test_visible_receding_hazard_skips_lost_track_hold(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        ranges = np.full(360, np.inf, dtype=np.float32)
+        ranges[np.argmin(np.abs(angles - math.pi / 2.0))] = 0.30
+        scan = LaserScan(ranges, angles, 0.05, 3.5)
+        supervisor = SafetySupervisor(RobotConfig(), SafetyConfig(), DynamicObstacleConfig())
+        approaching = DynamicObstacle(1, 0.0, 0.46, 0.0, -0.35, 0.16, 1.0, 0.0)
+        receding = DynamicObstacle(1, 0.0, 0.48, 0.0, 0.35, 0.16, 1.0, 0.1)
+
+        first = supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"), scan, Pose2D(), (approaching,), 0.0
+        )
+        release = supervisor.guard(
+            ControlCommand(0.20, 0.0, "test"),
+            LaserScan(np.full(360, np.inf, dtype=np.float32), angles, 0.05, 3.5),
+            Pose2D(),
+            (receding,),
+            0.1,
+        )
+
+        self.assertTrue(first.reason.startswith("predictive"))
+        self.assertEqual(release.reason, "safety release dwell")
+        self.assertEqual(supervisor.last_override_reason, "safety release dwell")
 
     def test_deliberate_rotation_is_not_reported_as_stuck(self):
         supervisor = SafetySupervisor(
@@ -246,6 +765,7 @@ class DynamicObstacleTrackingTests(unittest.TestCase):
             if index == 1:
                 self.assertEqual(len(frame.tracks), 0)
                 self.assertEqual(len(frame.planning_tracks), 1)
+                self.assertGreater(frame.planning_tracks[0].vy, 0.15)
 
         self.assertEqual(len(frame.tracks), 1)
         self.assertEqual(len(frame.planning_tracks), 1)
