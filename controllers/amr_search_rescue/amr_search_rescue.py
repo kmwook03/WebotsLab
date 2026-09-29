@@ -22,7 +22,17 @@ from models import (
     wrap_angle,
 )
 from perception import RedTargetDetector
-from planning import AStarPlanner, DynamicWindowPlanner, FrontierExplorer
+from planning import (
+    AStarPlanner,
+    DynamicWindowPlanner,
+    FrontierExplorer,
+    WaypointProgressMonitor,
+    append_breadcrumb,
+    breadcrumb_return_cost,
+    choose_local_detour,
+    reverse_breadcrumb_segment,
+    terminal_approach_path,
+)
 from safety import SafetySupervisor
 from tracking import DynamicObstacleTracker
 from visualization import MapDisplay
@@ -85,6 +95,20 @@ class AutonomousSearchAndRescue:
         self.departure_until = -math.inf
         self.last_visited_count = 0
         self.step_count = 0
+        self.return_direct_approach = False
+        self.return_detour_waypoint: Optional[Tuple[float, float]] = None
+        self.return_detour_until = -math.inf
+        self.return_detour_active = False
+        self.breadcrumbs: List[Tuple[float, float]] = []
+        self.return_breadcrumb_path: List[Tuple[float, float]] = []
+        self.return_breadcrumb_next_index: Optional[int] = None
+        self.return_breadcrumb_target_index: Optional[int] = None
+        self.return_breadcrumb_active = False
+        self.return_force_detour = False
+        self.return_progress = WaypointProgressMonitor(
+            CONFIG.planner.breadcrumb_stall_progress,
+            CONFIG.planner.breadcrumb_stall_active_time,
+        )
 
     def _scan(self) -> LaserScan:
         ranges = np.asarray(self.lidar.getRangeImage(), dtype=np.float32)
@@ -120,12 +144,105 @@ class AutonomousSearchAndRescue:
             return first != second
         return math.hypot(first[0] - second[0], first[1] - second[1]) > threshold
 
+    def _record_breadcrumb(self) -> None:
+        if self.mission.phase not in (
+            MissionPhase.BOOTSTRAP,
+            MissionPhase.EXPLORE,
+            MissionPhase.TARGET_APPROACH,
+            MissionPhase.CONFIRM_TARGET,
+        ):
+            return
+        append_breadcrumb(
+            self.breadcrumbs,
+            self.estimator.pose,
+            CONFIG.planner.breadcrumb_spacing,
+            CONFIG.planner.breadcrumb_loop_rejoin_distance,
+            CONFIG.planner.breadcrumb_loop_guard_points,
+        )
+
+    def _reset_return_breadcrumb_state(self) -> None:
+        self.return_breadcrumb_path = []
+        self.return_breadcrumb_next_index = None
+        self.return_breadcrumb_target_index = None
+        self.return_breadcrumb_active = False
+        self.return_force_detour = False
+        self.return_progress.reset()
+
+    def _apply_return_breadcrumb(self) -> Optional[Tuple[float, float]]:
+        if self.mission.phase != MissionPhase.RETURN_HOME or len(self.breadcrumbs) < 2:
+            self.return_breadcrumb_active = False
+            return None
+
+        pose = self.estimator.pose
+        target_index = self.return_breadcrumb_target_index
+        if target_index is None and self.return_breadcrumb_next_index is None:
+            home = self.breadcrumbs[0]
+            direct_distance = math.hypot(home[0] - pose.x, home[1] - pose.y)
+            remembered_cost = breadcrumb_return_cost(self.breadcrumbs, pose)
+            acceptable_cost = (
+                CONFIG.planner.breadcrumb_max_path_stretch * direct_distance
+                + CONFIG.planner.breadcrumb_path_slack
+            )
+            if remembered_cost > acceptable_cost:
+                self.return_breadcrumb_active = False
+                return None
+        if target_index is not None:
+            target = self.breadcrumbs[target_index]
+            if math.hypot(target[0] - pose.x, target[1] - pose.y) <= (
+                CONFIG.planner.breadcrumb_reached_distance
+            ):
+                self.return_breadcrumb_next_index = target_index - 1
+                self.return_breadcrumb_target_index = None
+                self.return_breadcrumb_path = []
+                self.return_detour_waypoint = None
+                self.return_detour_active = False
+                self.return_progress.reset()
+                target_index = None
+
+        if target_index is None:
+            segment, target_index = reverse_breadcrumb_segment(
+                self.breadcrumbs,
+                pose,
+                self.return_breadcrumb_next_index,
+                CONFIG.planner.breadcrumb_lookahead,
+            )
+            if target_index is None:
+                self.return_breadcrumb_active = False
+                return None
+            self.return_breadcrumb_path = segment[1:]
+            self.return_breadcrumb_target_index = target_index
+            self.return_breadcrumb_next_index = target_index
+            target = self.breadcrumbs[target_index]
+            self.return_progress.reset(
+                math.hypot(target[0] - pose.x, target[1] - pose.y)
+            )
+        else:
+            target = self.breadcrumbs[target_index]
+
+        target_distance = math.hypot(target[0] - pose.x, target[1] - pose.y)
+        prior_command_active = (
+            not self.safety.override_active
+            and not self.return_detour_active
+            and self.last_command.reason.startswith("DWA breadcrumb")
+            and abs(self.last_command.linear) + 0.08 * abs(self.last_command.angular) > 0.02
+        )
+        if self.return_progress.update(target_distance, self.dt, prior_command_active):
+            self.return_force_detour = True
+
+        self.return_breadcrumb_active = True
+        self.return_direct_approach = False
+        self.path = [(pose.x, pose.y), *self.return_breadcrumb_path]
+        return target
+
     def _update_plan(self, now: float) -> None:
         pose = self.estimator.pose
         phase = self.mission.phase
         periodic = now - self.last_plan_time >= CONFIG.planner.replan_period
 
         if phase == MissionPhase.EXPLORE:
+            self.return_direct_approach = False
+            self.return_detour_waypoint = None
+            self.return_detour_active = False
             reached = self.frontier_goal is not None and math.hypot(
                 pose.x - self.frontier_goal[0], pose.y - self.frontier_goal[1]
             ) < CONFIG.planner.goal_tolerance
@@ -140,15 +257,87 @@ class AutonomousSearchAndRescue:
         if desired is None:
             self.path = []
             self.current_goal = None
+            self.return_direct_approach = False
+            self.return_detour_waypoint = None
+            self.return_detour_active = False
             return
         endpoint_reached = self.path and math.hypot(
             pose.x - self.path[-1][0], pose.y - self.path[-1][1]
         ) < CONFIG.planner.goal_tolerance
         if self._goal_changed(desired, self.current_goal) or endpoint_reached or (periodic and self._path_invalid()):
             result = self.global_planner.plan(self.grid, (pose.x, pose.y), desired)
-            self.path = list(result.path) if result is not None else []
+            planned_path = list(result.path) if result is not None else []
+            if phase == MissionPhase.RETURN_HOME:
+                planned_path, self.return_direct_approach = terminal_approach_path(
+                    planned_path,
+                    pose,
+                    desired,
+                    CONFIG.planner.return_direct_approach_distance,
+                    CONFIG.planner.return_endpoint_error,
+                )
+            else:
+                self.return_direct_approach = False
+            self.path = planned_path
             self.current_goal = desired
             self.last_plan_time = now
+
+    def _apply_return_detour(
+        self,
+        now: float,
+        scan: LaserScan,
+        requested_goal: Optional[Tuple[float, float]] = None,
+    ) -> None:
+        if self.mission.phase != MissionPhase.RETURN_HOME or not (
+            self.return_direct_approach or self.return_breadcrumb_active
+        ):
+            self.return_detour_waypoint = None
+            self.return_detour_active = False
+            return
+        desired = requested_goal or self.mission.goal(self.frontier_goal)
+        if desired is None:
+            return
+        pose = self.estimator.pose
+        waypoint = self.return_detour_waypoint
+        # A safety stop is not an attempted traversal of this waypoint.  Keep
+        # the waypoint clock paused so release-dwell jitter cannot churn the
+        # chosen side before the robot has had real control time to try it.
+        if waypoint is not None and self.safety.override_active:
+            self.return_detour_until += self.dt
+        if waypoint is not None and (
+            now >= self.return_detour_until
+            or math.hypot(waypoint[0] - pose.x, waypoint[1] - pose.y)
+            <= CONFIG.planner.return_detour_reached_distance
+        ):
+            waypoint = None
+            self.return_detour_waypoint = None
+
+        if waypoint is None:
+            waypoint = choose_local_detour(
+                pose,
+                desired,
+                scan,
+                CONFIG.robot,
+                CONFIG.planner.return_detour_waypoint_distance,
+                CONFIG.planner.return_detour_min_travel,
+                math.radians(CONFIG.planner.return_detour_corridor_half_angle_deg),
+                math.radians(CONFIG.planner.return_detour_max_turn_deg),
+                self.breadcrumbs[: -CONFIG.planner.breadcrumb_recent_exclusion],
+                CONFIG.planner.breadcrumb_revisit_radius,
+                self.return_force_detour,
+            )
+            if waypoint is not None:
+                self.return_detour_waypoint = waypoint
+                self.return_detour_until = now + CONFIG.planner.return_detour_duration
+                self.return_force_detour = False
+
+        self.return_detour_active = waypoint is not None
+        if waypoint is not None:
+            # Keep the temporary waypoint as DWA's actual goal.  Appending the
+            # home pose here makes the goal-progress term cut the corner and,
+            # once the waypoint is inside the lookahead radius, makes the
+            # heading term skip it altogether.  MissionManager still owns the
+            # true home goal and restores it after this waypoint is reached.
+            self.path = [(pose.x, pose.y), waypoint]
 
     def _nominal_command(self, now: float, scan: LaserScan) -> ControlCommand:
         phase = self.mission.phase
@@ -222,9 +411,11 @@ class AutonomousSearchAndRescue:
 
         self._update_plan(now)
         self._prune_path()
+        breadcrumb_target = self._apply_return_breadcrumb()
+        self._apply_return_detour(now, scan, breadcrumb_target)
         if self.path:
             self.fallback_heading = None
-            return self.local_planner.command(
+            planned = self.local_planner.command(
                 self.estimator.pose,
                 self.estimator.velocity,
                 self.path,
@@ -233,6 +424,27 @@ class AutonomousSearchAndRescue:
                 self.dynamic_frame.planning_tracks,
                 now,
             )
+            if phase == MissionPhase.RETURN_HOME and (
+                self.return_direct_approach or self.return_breadcrumb_active
+            ):
+                return ControlCommand(
+                    planned.linear,
+                    planned.angular,
+                    (
+                        (
+                            "DWA breadcrumb detour"
+                            if self.return_breadcrumb_active
+                            else "DWA home detour"
+                        )
+                        if self.return_detour_active
+                        else (
+                            "DWA breadcrumb return"
+                            if self.return_breadcrumb_active
+                            else "DWA direct home"
+                        )
+                    ),
+                )
+            return planned
         if phase == MissionPhase.EXPLORE:
             if self.fallback_heading is None or now >= self.fallback_until:
                 clearance = np.asarray(scan.ranges, dtype=np.float32).copy()
@@ -340,6 +552,7 @@ class AutonomousSearchAndRescue:
                 self.grid.update(self.estimator.pose, scan, self.dynamic_frame.ignored_hit_mask)
                 self.grid.decay_dynamic_regions(self.dynamic_frame.tracks)
                 self.last_detection = self._detection(scan)
+                self._record_breadcrumb()
 
                 transition = self.mission.update(now, self.estimator.pose, self.last_detection)
                 if self.mission.visited_count > self.last_visited_count:
@@ -352,6 +565,8 @@ class AutonomousSearchAndRescue:
                     self.path = []
                     self.current_goal = None
                     self.fallback_heading = None
+                    if self.mission.phase == MissionPhase.RETURN_HOME:
+                        self._reset_return_breadcrumb_state()
                     if self.mission.phase != MissionPhase.EXPLORE:
                         self.frontier_goal = None
 
@@ -362,6 +577,7 @@ class AutonomousSearchAndRescue:
                     self.estimator.pose,
                     tuple(self.dynamic_frame.safety_tracks),
                     now,
+                    self.estimator.velocity,
                 )
                 if (
                     self.mission.phase not in (MissionPhase.BOOTSTRAP, MissionPhase.RECOVERY, MissionPhase.COMPLETE)
@@ -374,6 +590,7 @@ class AutonomousSearchAndRescue:
                         self.estimator.pose,
                         tuple(self.dynamic_frame.safety_tracks),
                         now,
+                        self.estimator.velocity,
                     )
                 self.last_command = command
                 self._actuate(command)

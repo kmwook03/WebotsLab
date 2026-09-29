@@ -25,6 +25,233 @@ from models import (
 WorldPoint = Tuple[float, float]
 
 
+def append_breadcrumb(
+    trail: List[WorldPoint],
+    pose: Pose2D,
+    spacing: float,
+    loop_rejoin_distance: float = 0.0,
+    loop_guard_points: int = 3,
+) -> bool:
+    """Append pose progress and erase the tail when a route loop closes."""
+    point = (pose.x, pose.y)
+    if trail and math.hypot(point[0] - trail[-1][0], point[1] - trail[-1][1]) < spacing:
+        return False
+    searchable_count = max(0, len(trail) - max(1, loop_guard_points))
+    if loop_rejoin_distance > 0.0 and searchable_count:
+        rejoin_index = min(
+            range(searchable_count),
+            key=lambda index: math.hypot(
+                point[0] - trail[index][0], point[1] - trail[index][1]
+            ),
+        )
+        rejoin_distance = math.hypot(
+            point[0] - trail[rejoin_index][0],
+            point[1] - trail[rejoin_index][1],
+        )
+        if rejoin_distance <= loop_rejoin_distance:
+            del trail[rejoin_index + 1 :]
+            if rejoin_distance >= spacing:
+                trail.append(point)
+            return True
+    trail.append(point)
+    return True
+
+
+def reverse_breadcrumb_segment(
+    trail: Sequence[WorldPoint],
+    pose: Pose2D,
+    next_index: Optional[int],
+    lookahead_distance: float,
+) -> Tuple[List[WorldPoint], Optional[int]]:
+    """Return a recent-to-old path segment and its oldest target index."""
+    if len(trail) < 2:
+        return [], None
+    cursor = len(trail) - 2 if next_index is None else min(next_index, len(trail) - 1)
+    if cursor < 0:
+        return [], None
+
+    path = [(pose.x, pose.y)]
+    previous = path[0]
+    travelled = 0.0
+    target_index = cursor
+    while target_index >= 0:
+        point = trail[target_index]
+        travelled += math.hypot(point[0] - previous[0], point[1] - previous[1])
+        path.append(point)
+        previous = point
+        if travelled >= lookahead_distance or target_index == 0:
+            break
+        target_index -= 1
+    return path, target_index
+
+
+def breadcrumb_return_cost(
+    trail: Sequence[WorldPoint],
+    pose: Pose2D,
+    next_index: Optional[int] = None,
+) -> float:
+    """Length of the remembered route from the current pose back to home."""
+    if len(trail) < 2:
+        return math.inf
+    cursor = len(trail) - 2 if next_index is None else min(next_index, len(trail) - 1)
+    if cursor < 0:
+        return 0.0
+    cost = math.hypot(pose.x - trail[cursor][0], pose.y - trail[cursor][1])
+    for index in range(cursor, 0, -1):
+        cost += math.hypot(
+            trail[index][0] - trail[index - 1][0],
+            trail[index][1] - trail[index - 1][1],
+        )
+    return cost
+
+
+class WaypointProgressMonitor:
+    """Measure commanded, non-safety time without meaningful target progress."""
+
+    def __init__(self, min_progress: float, timeout: float):
+        self.min_progress = min_progress
+        self.timeout = timeout
+        self.best_distance = math.inf
+        self.active_elapsed = 0.0
+
+    def reset(self, distance: float = math.inf) -> None:
+        self.best_distance = distance
+        self.active_elapsed = 0.0
+
+    def update(self, distance: float, dt: float, active: bool) -> bool:
+        if not math.isfinite(self.best_distance):
+            self.reset(distance)
+            return False
+        if distance <= self.best_distance - self.min_progress:
+            self.reset(distance)
+            return False
+        self.best_distance = min(self.best_distance, distance)
+        if active:
+            self.active_elapsed += max(0.0, dt)
+        if self.active_elapsed + 1e-9 < self.timeout:
+            return False
+        self.reset(distance)
+        return True
+
+
+def terminal_approach_path(
+    path: Sequence[WorldPoint],
+    pose: Pose2D,
+    requested_goal: WorldPoint,
+    direct_approach_distance: float,
+    max_endpoint_error: float,
+) -> Tuple[List[WorldPoint], bool]:
+    """Replace a badly snapped terminal path with a short live-sensor approach.
+
+    A* may move a blocked requested goal to the nearest mapped free cell.  That
+    is useful during ordinary navigation, but near the known start pose it can
+    make the local planner stop at the snapped cell while the mission is still
+    waiting for the true home tolerance.  The direct segment remains subject
+    to DWA's live LiDAR collision checks and the independent safety guard.
+    """
+    planned = list(path)
+    goal_distance = math.hypot(
+        requested_goal[0] - pose.x,
+        requested_goal[1] - pose.y,
+    )
+    endpoint_error = (
+        math.hypot(
+            planned[-1][0] - requested_goal[0],
+            planned[-1][1] - requested_goal[1],
+        )
+        if planned
+        else math.inf
+    )
+    if (
+        goal_distance <= direct_approach_distance
+        and endpoint_error > max_endpoint_error
+    ):
+        return [(pose.x, pose.y), requested_goal], True
+    return planned, False
+
+
+def choose_local_detour(
+    pose: Pose2D,
+    requested_goal: WorldPoint,
+    scan: LaserScan,
+    robot: RobotConfig,
+    waypoint_distance: float,
+    min_travel: float,
+    corridor_half_angle: float,
+    max_turn: float,
+    visited_points: Sequence[WorldPoint] = (),
+    visited_radius: float = 0.0,
+    force: bool = False,
+) -> Optional[WorldPoint]:
+    """Choose a short, open LiDAR corridor that still progresses home."""
+    goal_dx = requested_goal[0] - pose.x
+    goal_dy = requested_goal[1] - pose.y
+    goal_distance = math.hypot(goal_dx, goal_dy)
+    if goal_distance <= 1e-6 or scan.ranges.size == 0:
+        return None
+
+    direct_bearing = angle_difference(math.atan2(goal_dy, goal_dx), pose.theta)
+    ranges = np.asarray(scan.ranges, dtype=np.float32)
+    usable = np.where(
+        np.isfinite(ranges),
+        np.clip(ranges, 0.0, scan.max_range),
+        scan.max_range,
+    )
+    if scan.angles.size > 1:
+        angular_resolution = float(np.median(np.abs(np.diff(scan.angles))))
+    else:
+        angular_resolution = 2.0 * math.pi
+    window_radius = max(1, int(round(corridor_half_angle / angular_resolution)))
+    windows = [np.roll(usable, offset) for offset in range(-window_radius, window_radius + 1)]
+    corridor_clearance = np.percentile(np.stack(windows), 20.0, axis=0)
+
+    bearing_error = np.abs(
+        (scan.angles - direct_bearing + math.pi) % (2.0 * math.pi) - math.pi
+    )
+    direct_index = int(np.argmin(bearing_error))
+    footprint_clearance = robot.robot_radius + robot.safety_margin + 0.05
+    required_direct = min(goal_distance, waypoint_distance) + footprint_clearance
+    if not force and float(corridor_clearance[direct_index]) >= required_direct:
+        return None
+
+    best: Tuple[float, WorldPoint] | None = None
+    for index in range(0, scan.angles.size, 3):
+        bearing = float(scan.angles[index])
+        turn_from_goal = abs(angle_difference(bearing, direct_bearing))
+        if turn_from_goal > max_turn:
+            continue
+        available_travel = float(corridor_clearance[index]) - footprint_clearance
+        travel = min(waypoint_distance, available_travel)
+        if travel < min_travel:
+            continue
+        heading = pose.theta + bearing
+        waypoint = (
+            pose.x + travel * math.cos(heading),
+            pose.y + travel * math.sin(heading),
+        )
+        remaining = math.hypot(
+            requested_goal[0] - waypoint[0],
+            requested_goal[1] - waypoint[1],
+        )
+        progress = goal_distance - remaining
+        revisit_penalty = 0.0
+        if visited_points and visited_radius > 0.0:
+            nearest_visited = min(
+                math.hypot(waypoint[0] - point[0], waypoint[1] - point[1])
+                for point in visited_points
+            )
+            revisit_penalty = max(0.0, 1.0 - nearest_visited / visited_radius)
+        score = (
+            2.4 * progress
+            + 0.35 * min(float(corridor_clearance[index]), 1.5)
+            - 0.18 * turn_from_goal
+            - 0.85 * revisit_penalty
+        )
+        if best is None or score > best[0]:
+            best = (score, waypoint)
+    return None if best is None else best[1]
+
+
 class AStarPlanner:
     def __init__(self, config: PlannerConfig):
         self.config = config
