@@ -10,10 +10,11 @@ class RobotConfig:
     robot_radius: float = 0.115
     safety_margin: float = 0.075
     max_wheel_speed: float = 9.00
-    max_linear_speed: float = 0.285
+    max_linear_speed: float = 0.22
     max_angular_speed: float = 1.85
     max_linear_accel: float = 0.62
     max_angular_accel: float = 3.20
+    gyro_weight: float = 0.70
 
 
 @dataclass(frozen=True)
@@ -69,12 +70,39 @@ class PlannerConfig:
 
 
 @dataclass(frozen=True)
+class DynamicObstacleConfig:
+    cluster_gap: float = 0.18
+    min_cluster_points: int = 3
+    min_cluster_width: float = 0.08
+    max_cluster_width: float = 0.55
+    association_distance: float = 0.30
+    velocity_alpha: float = 0.42
+    moving_speed: float = 0.12
+    confirmation_hits: int = 4
+    moving_confirmation_hits: int = 3
+    track_timeout: float = 0.65
+    obstacle_radius_min: float = 0.14
+    obstacle_radius_max: float = 0.32
+    prediction_horizon: float = 1.50
+    planning_prediction_horizon: float = 2.20
+    prediction_dt: float = 0.10
+    safety_margin: float = 0.10
+    uncertainty_rate: float = 0.055
+    missed_uncertainty_rate: float = 0.20
+    release_dwell: float = 0.50
+    hazard_release_margin: float = 0.35
+    lost_track_hold: float = 1.00
+
+
+@dataclass(frozen=True)
 class MissionConfig:
     bootstrap_rotation: float = 5.9
     bootstrap_timeout: float = 11.0
     target_stable_frames: int = 4
     required_target_count: int = 3
-    target_dedup_distance: float = 2.2
+    target_dedup_distance: float = 1.0
+    target_dedup_bearing_deg: float = 14.0
+    target_track_bearing_deg: float = 45.0
     target_rearm_distance: float = 1.2
     target_stop_distance: float = 0.95
     target_confirm_time: float = 1.2
@@ -91,6 +119,7 @@ class SafetyConfig:
     stuck_window: float = 3.0
     stuck_distance: float = 0.035
     recovery_duration: float = 1.8
+    emergency_surface_distance: float = 0.42
 
 
 @dataclass(frozen=True)
@@ -99,6 +128,7 @@ class Config:
     mapping: MapConfig = field(default_factory=MapConfig)
     target: TargetConfig = field(default_factory=TargetConfig)
     planner: PlannerConfig = field(default_factory=PlannerConfig)
+    dynamic: DynamicObstacleConfig = field(default_factory=DynamicObstacleConfig)
     mission: MissionConfig = field(default_factory=MissionConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
 

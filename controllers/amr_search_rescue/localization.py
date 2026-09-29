@@ -107,7 +107,8 @@ class PoseEstimator:
         distance = 0.5 * (left_distance + right_distance)
         wheel_rotation = (right_distance - left_distance) / self.config.axle_length
         gyro_rotation = gyro_z * dt if math.isfinite(gyro_z) and abs(gyro_z) < 6.0 else wheel_rotation
-        rotation = 0.82 * wheel_rotation + 0.18 * gyro_rotation
+        gyro_weight = float(np.clip(self.config.gyro_weight, 0.0, 1.0))
+        rotation = (1.0 - gyro_weight) * wheel_rotation + gyro_weight * gyro_rotation
         midpoint = self.pose.theta + 0.5 * rotation
         self.pose.x += distance * math.cos(midpoint)
         self.pose.y += distance * math.sin(midpoint)

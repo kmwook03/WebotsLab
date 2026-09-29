@@ -39,6 +39,34 @@ class ControlCommand:
     reason: str = "idle"
 
 
+@dataclass(frozen=True)
+class DynamicObstacle:
+    track_id: int
+    x: float
+    y: float
+    vx: float
+    vy: float
+    radius: float
+    confidence: float
+    last_seen: float
+
+    def predicted_position(self, seconds: float) -> Tuple[float, float]:
+        return self.x + self.vx * seconds, self.y + self.vy * seconds
+
+
+@dataclass
+class DynamicObstacleFrame:
+    tracks: Sequence[DynamicObstacle]
+    planning_tracks: Sequence[DynamicObstacle]
+    safety_tracks: Sequence[DynamicObstacle]
+    ignored_hit_mask: np.ndarray
+    active_track_count: int = 0
+
+    @classmethod
+    def empty(cls, scan_size: int = 0) -> "DynamicObstacleFrame":
+        return cls((), (), (), np.zeros(scan_size, dtype=bool), 0)
+
+
 @dataclass
 class LaserScan:
     ranges: np.ndarray

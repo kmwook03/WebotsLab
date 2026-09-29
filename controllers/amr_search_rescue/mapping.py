@@ -6,7 +6,7 @@ from typing import Iterable, List, Optional, Tuple
 import numpy as np
 
 from config import MapConfig
-from models import LaserScan, Pose2D
+from models import DynamicObstacle, LaserScan, Pose2D
 
 
 GridCell = Tuple[int, int]
@@ -64,7 +64,12 @@ class OccupancyGrid:
     def grid_to_world(self, x: int, y: int) -> Tuple[float, float]:
         return ((x - self.origin) * self.resolution, (y - self.origin) * self.resolution)
 
-    def update(self, pose: Pose2D, scan: LaserScan) -> None:
+    def update(
+        self,
+        pose: Pose2D,
+        scan: LaserScan,
+        ignored_hit_mask: Optional[np.ndarray] = None,
+    ) -> None:
         self.update_count += 1
         origin = self.world_to_grid(pose.x, pose.y)
         if not self.in_bounds(origin, 1):
@@ -91,7 +96,12 @@ class OccupancyGrid:
                     break
                 x, y = cell
                 self.log_odds[y, x] += self.config.free_log_odds
-            if hit and self.in_bounds(cells[-1], 1):
+            ignore_hit = (
+                ignored_hit_mask is not None
+                and index < ignored_hit_mask.size
+                and bool(ignored_hit_mask[index])
+            )
+            if hit and not ignore_hit and self.in_bounds(cells[-1], 1):
                 x, y = cells[-1]
                 self.log_odds[y, x] += self.config.occupied_log_odds
                 self.last_hit[y, x] = self.update_count
@@ -105,6 +115,25 @@ class OccupancyGrid:
         if self.update_count % 30 == 0:
             self._decay_stale_obstacles()
         self._inflation_cache.clear()
+
+    def decay_dynamic_regions(self, obstacles: Iterable[DynamicObstacle]) -> None:
+        changed = False
+        for obstacle in obstacles:
+            radius_cells = max(1, int(math.ceil((obstacle.radius + 0.10) / self.resolution)))
+            cx, cy = self.world_to_grid(obstacle.x, obstacle.y)
+            y0, y1 = max(0, cy - radius_cells), min(self.size, cy + radius_cells + 1)
+            x0, x1 = max(0, cx - radius_cells), min(self.size, cx + radius_cells + 1)
+            if x0 >= x1 or y0 >= y1:
+                continue
+            ys, xs = np.ogrid[y0:y1, x0:x1]
+            circle = (xs - cx) ** 2 + (ys - cy) ** 2 <= radius_cells ** 2
+            region = self.log_odds[y0:y1, x0:x1]
+            positive = circle & (region > 0.0)
+            if np.any(positive):
+                region[positive] *= 0.55
+                changed = True
+        if changed:
+            self._inflation_cache.clear()
 
     def _decay_stale_obstacles(self) -> None:
         age = self.update_count - self.last_hit

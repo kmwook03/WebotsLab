@@ -12,10 +12,19 @@ from config import CONFIG
 from localization import PoseEstimator
 from mapping import OccupancyGrid
 from mission import MissionManager
-from models import ControlCommand, LaserScan, MissionPhase, TargetDetection, angle_difference, wrap_angle
+from models import (
+    ControlCommand,
+    DynamicObstacleFrame,
+    LaserScan,
+    MissionPhase,
+    TargetDetection,
+    angle_difference,
+    wrap_angle,
+)
 from perception import RedTargetDetector
 from planning import AStarPlanner, DynamicWindowPlanner, FrontierExplorer
 from safety import SafetySupervisor
+from tracking import DynamicObstacleTracker
 from visualization import MapDisplay
 
 
@@ -58,8 +67,10 @@ class AutonomousSearchAndRescue:
         self.target_detector = RedTargetDetector(CONFIG.target)
         self.global_planner = AStarPlanner(CONFIG.planner)
         self.explorer = FrontierExplorer(CONFIG.planner, self.global_planner)
-        self.local_planner = DynamicWindowPlanner(CONFIG.robot, CONFIG.planner)
-        self.safety = SafetySupervisor(CONFIG.robot, CONFIG.safety)
+        self.local_planner = DynamicWindowPlanner(CONFIG.robot, CONFIG.planner, CONFIG.dynamic)
+        self.dynamic_tracker = DynamicObstacleTracker(CONFIG.dynamic)
+        self.dynamic_frame = DynamicObstacleFrame.empty(resolution)
+        self.safety = SafetySupervisor(CONFIG.robot, CONFIG.safety, CONFIG.dynamic)
         self.mission = MissionManager(CONFIG.mission)
 
         self.path: List[Tuple[float, float]] = []
@@ -164,6 +175,51 @@ class AutonomousSearchAndRescue:
         if phase == MissionPhase.EXPLORE and now < self.departure_until:
             return ControlCommand(-0.18, 0.16, "leave confirmed target")
 
+        # Once the mission manager has associated the current camera blob with
+        # the locked, unvisited target, use its bearing directly.  Monocular
+        # range can be deliberately conservative at long distance; letting an
+        # A* path to that noisy endpoint take precedence made the robot orbit
+        # an already mapped area instead of closing on the visible marker.
+        if (
+            phase == MissionPhase.TARGET_APPROACH
+            and self.last_detection.seen
+            and self.mission.target_observation_accepted
+        ):
+            angular = float(np.clip(1.7 * self.last_detection.bearing, -0.8, 0.8))
+            range_m = self.last_detection.range_m or CONFIG.mission.target_stop_distance
+            range_error = max(0.0, range_m - CONFIG.mission.target_stop_distance)
+            approach_speed = float(np.clip(0.09 + 0.045 * range_error, 0.09, 0.22))
+            heading_scale = float(np.clip(1.0 - abs(self.last_detection.bearing) / 0.75, 0.35, 1.0))
+            visual_command = ControlCommand(
+                approach_speed * heading_scale,
+                angular,
+                "visual target servo",
+            )
+            if not self.dynamic_frame.planning_tracks:
+                return visual_command
+
+            # A provisional moving track should influence target approach
+            # before it escalates into a safety override.  Build a short local
+            # path from the live camera bearing so DWA can slow or steer around
+            # the mover without trusting the noisy long-range monocular goal.
+            pose = self.estimator.pose
+            local_distance = float(np.clip(range_m, 0.8, 2.0))
+            local_heading = pose.theta + self.last_detection.bearing
+            visual_goal = (
+                pose.x + local_distance * math.cos(local_heading),
+                pose.y + local_distance * math.sin(local_heading),
+            )
+            planned = self.local_planner.command(
+                pose,
+                self.estimator.velocity,
+                [(pose.x, pose.y), visual_goal],
+                scan,
+                self.dt,
+                self.dynamic_frame.planning_tracks,
+                now,
+            )
+            return ControlCommand(planned.linear, planned.angular, "visual DWA")
+
         self._update_plan(now)
         self._prune_path()
         if self.path:
@@ -174,14 +230,9 @@ class AutonomousSearchAndRescue:
                 self.path,
                 scan,
                 self.dt,
+                self.dynamic_frame.planning_tracks,
+                now,
             )
-        if phase == MissionPhase.TARGET_APPROACH and self.last_detection.seen:
-            angular = float(np.clip(1.7 * self.last_detection.bearing, -0.8, 0.8))
-            range_m = self.last_detection.range_m or CONFIG.mission.target_stop_distance
-            range_error = max(0.0, range_m - CONFIG.mission.target_stop_distance)
-            approach_speed = float(np.clip(0.09 + 0.045 * range_error, 0.09, 0.22))
-            heading_scale = float(np.clip(1.0 - abs(self.last_detection.bearing) / 0.75, 0.35, 1.0))
-            return ControlCommand(approach_speed * heading_scale, angular, "visual target servo")
         if phase == MissionPhase.EXPLORE:
             if self.fallback_heading is None or now >= self.fallback_until:
                 clearance = np.asarray(scan.ranges, dtype=np.float32).copy()
@@ -196,7 +247,10 @@ class AutonomousSearchAndRescue:
             heading_error = angle_difference(self.fallback_heading, self.estimator.pose.theta)
             angular = float(np.clip(1.35 * heading_error, -0.90, 0.90))
             aligned = max(0.0, 1.0 - abs(heading_error) / 0.65)
-            linear = 0.0 if abs(heading_error) > 0.50 else 0.12 + 0.12 * aligned
+            linear = 0.0 if abs(heading_error) > 0.50 else min(
+                CONFIG.robot.max_linear_speed,
+                0.10 + 0.10 * aligned,
+            )
             return ControlCommand(linear, angular, "open-space exploration fallback")
         return ControlCommand(0.0, 0.52, "search for reachable frontier")
 
@@ -224,6 +278,28 @@ class AutonomousSearchAndRescue:
             "targets_required": CONFIG.mission.required_target_count,
             "command": [round(self.last_command.linear, 3), round(self.last_command.angular, 3)],
             "reason": self.last_command.reason,
+            "dynamic_tracks": len(self.dynamic_frame.tracks),
+            "planning_tracks": len(self.dynamic_frame.planning_tracks),
+            "active_tracks": self.dynamic_frame.active_track_count,
+            "predicted_clearance": (
+                None
+                if not math.isfinite(self.safety.last_min_clearance)
+                else round(self.safety.last_min_clearance, 3)
+            ),
+            "ttc": None if self.safety.last_ttc is None else round(self.safety.last_ttc, 3),
+            "safety_override": self.safety.override_active,
+            "safety_reason": self.safety.last_override_reason,
+            "dynamic_state": [
+                [
+                    track.track_id,
+                    round(track.x, 2),
+                    round(track.y, 2),
+                    round(track.vx, 2),
+                    round(track.vy, 2),
+                    round(track.confidence, 2),
+                ]
+                for track in self.dynamic_frame.tracks
+            ],
         }
         self.emitter.send(json.dumps(status).encode("utf-8"))
         print(
@@ -232,6 +308,9 @@ class AutonomousSearchAndRescue:
             f"known={status['map_cells']:5d} target={status['target_confidence']:.2f}/"
             f"{status['target_range'] if status['target_range'] is not None else '-'}m "
             f"visited={status['targets_visited']}/{status['targets_required']} "
+            f"dyn={status['dynamic_tracks']}/{status['planning_tracks']}/{status['active_tracks']} "
+            f"ttc={status['ttc'] if status['ttc'] is not None else '-'} "
+            f"safety={status['safety_reason'] or '-'} tracks={status['dynamic_state']} "
             f"cmd=({self.last_command.linear:+.2f},{self.last_command.angular:+.2f}) {self.last_command.reason}"
         )
 
@@ -252,7 +331,14 @@ class AutonomousSearchAndRescue:
                 scan = self._scan()
                 if self.step_count % 16 == 0:
                     self.estimator.correct_with_scan(scan, self.grid)
-                self.grid.update(self.estimator.pose, scan)
+                self.dynamic_frame = self.dynamic_tracker.update(
+                    now,
+                    self.estimator.pose,
+                    scan,
+                    self.grid,
+                )
+                self.grid.update(self.estimator.pose, scan, self.dynamic_frame.ignored_hit_mask)
+                self.grid.decay_dynamic_regions(self.dynamic_frame.tracks)
                 self.last_detection = self._detection(scan)
 
                 transition = self.mission.update(now, self.estimator.pose, self.last_detection)
@@ -260,9 +346,6 @@ class AutonomousSearchAndRescue:
                     self.departure_until = now + 7.0
                     self.last_visited_count = self.mission.visited_count
                 elif transition and "confirmed; resume search" in transition:
-                    # A revisit rejected by spatial de-duplication still needs
-                    # the same departure manoeuvre; otherwise the camera keeps
-                    # reacquiring that already-counted object.
                     self.departure_until = now + 7.0
                 if transition:
                     print(f"[MISSION] {transition}")
@@ -273,18 +356,36 @@ class AutonomousSearchAndRescue:
                         self.frontier_goal = None
 
                 command = self._nominal_command(now, scan)
-                command = self.safety.guard(command, scan)
+                command = self.safety.guard(
+                    command,
+                    scan,
+                    self.estimator.pose,
+                    tuple(self.dynamic_frame.safety_tracks),
+                    now,
+                )
                 if (
                     self.mission.phase not in (MissionPhase.BOOTSTRAP, MissionPhase.RECOVERY, MissionPhase.COMPLETE)
                     and self.safety.is_stuck(now, self.estimator.pose, command)
                 ):
                     self.mission.enter_recovery(now, "commanded motion without pose progress")
-                    command = ControlCommand(-0.05, 0.9, "begin stuck recovery")
+                    command = self.safety.guard(
+                        ControlCommand(-0.05, 0.9, "begin stuck recovery"),
+                        scan,
+                        self.estimator.pose,
+                        tuple(self.dynamic_frame.safety_tracks),
+                        now,
+                    )
                 self.last_command = command
                 self._actuate(command)
 
                 if self.step_count % 32 == 0:
-                    self.display.draw(self.grid, self.estimator.pose, self.path, self.current_goal)
+                    self.display.draw(
+                        self.grid,
+                        self.estimator.pose,
+                        self.path,
+                        self.current_goal,
+                        self.dynamic_frame.tracks,
+                    )
                 self._publish(now)
         except Exception:
             self._actuate(ControlCommand())

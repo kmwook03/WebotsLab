@@ -279,6 +279,8 @@
 │  │  ├─ amr_search_rescue.py   # Webots 연결 및 메인 루프
 │  │  ├─ config.py              # 물리·지도·계획·미션·안전 파라미터
 │  │  ├─ models.py              # 공통 데이터 모델
+│  │  ├─ collision.py           # 정적·동적 궤적 충돌 예측
+│  │  ├─ tracking.py            # LiDAR 군집 및 속도 추적
 │  │  ├─ localization.py        # 오도메트리 + scan matching
 │  │  ├─ mapping.py             # log-odds occupancy grid
 │  │  ├─ perception.py          # 빨간 표적 인식
@@ -375,16 +377,24 @@ red - green &gt; 55</code></pre>
             연결 성분의 중심으로 방위각을 구하고 알려진 표적 높이 0.60m로 단안 거리를 계산한다.
             같은 방위의 LiDAR 거리와 일치할 때만 두 값을 융합해 주변 장애물을 표적으로 오인하는 현상을 줄인다.
           </p>
-          <p>전역 경로가 아직 생성되지 않은 경우에도 거리와 방위각에 따라 0.09~0.22m/s로 표적을 추종한다.</p>
+          <p>
+            접근 중인 미방문 표적과 방위가 연속되는 관측만 후보 갱신과 비주얼 서보에 사용한다.
+            표적이 보이는 동안에는 단안 거리의 큰 오차로 만든 전역 경로보다 거리와 방위각 기반
+            0.09~0.22m/s 비주얼 서보를 우선한다.
+          </p>
         </article>
 
         <article class="step">
           <h3>명시적 미션 상태기계</h3>
-          <pre><code>BOOTSTRAP → EXPLORE → TARGET_APPROACH
-          → CONFIRM_TARGET → RETURN_HOME → COMPLETE</code></pre>
+          <pre><code>BOOTSTRAP → EXPLORE → TARGET_APPROACH → CONFIRM_TARGET
+                         ↑                 │
+                         └── 3개 완료 전 ──┘
+          3개 완료 → RETURN_HOME → COMPLETE</code></pre>
           <p>
             표적이 연속 4프레임 이상 안정적으로 보이면 접근을 시작한다. 표적 거리 0.95m 부근에서 정지해
-            1.2초 동안 확인한 뒤 출발점으로 복귀한다. 움직이지 못하면 임시 <code>RECOVERY</code> 상태로 전환된다.
+            1.2초 동안 확인한다. 확인된 세계 위치와 현재 카메라 방위를 함께 비교해 같은 표적의 거리 오차를
+            새 표적으로 세지 않으며, 고유 표적 3개를 확인한 뒤에만 출발점으로 복귀한다. 움직이지 못하면
+            임시 <code>RECOVERY</code> 상태로 전환된다.
           </p>
         </article>
 
@@ -392,26 +402,29 @@ red - green &gt; 55</code></pre>
           <h3>DWA 지역 경로계획</h3>
           <p>
             현재 속도와 가속도 제한 안에서 여러 선속도·각속도 조합을 만들고 각 후보 궤적을 1.35초간 예측한다.
-            목적지 진전, heading, 장애물 여유, 경로 거리, 속도와 회전량을 함께 평가한다.
+            연속 LiDAR 프레임의 compact cluster는 로봇 이동을 보정한 세계 좌표에서 연결하고 속도를 추정한다.
+            목적지 진전, heading, 정적 여유, 동적 예측 여유, 경로 거리, 속도와 회전량을 함께 평가한다.
           </p>
           <p>
-            예측 궤적이 <code>robot_radius + safety_margin</code> 이내로 장애물에 접근하거나 현재 속도로
-            제동할 수 없으면 해당 후보는 즉시 폐기된다.
+            예측 궤적이 <code>robot_radius + safety_margin</code> 이내로 정적 장애물 또는 시간별 동적 장애물
+            예측 위치에 접근하거나 현재 속도로 제동할 수 없으면 해당 후보는 즉시 폐기된다.
           </p>
         </article>
 
         <article class="step">
           <h3>독립 안전검사와 모터 출력</h3>
           <p>
-            DWA가 만든 명령도 마지막 안전 계층을 통과해야 한다. 전방 ±42°에서는 속도 비례 TTC 정지거리를,
-            측후방을 포함한 360°에서는 근접 이탈 검사를 적용한다.
+            DWA가 만든 명령도 마지막 안전 계층을 통과해야 한다. 전방 ±42°의 속도 비례 정지거리와
+            360° compact cluster의 상대 TTC를 함께 검사한다. 위험 시 정지·전후진·좌우 회전 후보를 동일한
+            예측기로 평가하고 실제 분리거리를 개선하는 명령만 선택한다.
           </p>
           <pre><code>stopping distance = robot radius
                   + hard-stop distance
                   + forward speed × TTC horizon</code></pre>
           <p>
-            장애물이 정지거리 안에 있으면 명령을 덮어쓰고 더 넓은 방향으로 회전한다. 3초간 제어 명령이
-            있었지만 3.5cm 미만으로 이동하면 후진·회전 recovery를 수행한다.
+            위험 트랙은 ID로 유지하고 충분히 멀어진 뒤에도 짧은 release dwell을 적용해 방향 반전과 센서 가림에
+            의한 재출발 진동을 막는다. 3초간 적용된 제어 명령이 있었지만 3.5cm 미만으로 이동하면 recovery를
+            수행하며, recovery 명령도 최종 안전검사를 다시 통과한다.
           </p>
         </article>
       </div>
@@ -497,7 +510,8 @@ EVALUATION: PASS</code></pre>
           <tr><td><code>axle_length</code></td><td>0.160m</td><td>좌우 바퀴 중심 간 거리</td></tr>
           <tr><td><code>robot_radius</code></td><td>0.115m</td><td>충돌 검사에 사용하는 몸체 반경</td></tr>
           <tr><td><code>max_wheel_speed</code></td><td>9.00rad/s</td><td>사용할 최대 바퀴 속도</td></tr>
-          <tr><td><code>max_linear_speed</code></td><td>0.285m/s</td><td>DWA 최대 전진 속도</td></tr>
+          <tr><td><code>max_linear_speed</code></td><td>0.22m/s</td><td>DWA 최대 전진 속도</td></tr>
+          <tr><td><code>gyro_weight</code></td><td>0.70</td><td>급회피·복구 중 heading 융합의 gyro 비중</td></tr>
         </tbody>
       </table>
       <pre><code>new wheel radius = old radius × actual distance / estimated distance</code></pre>
@@ -533,6 +547,8 @@ EVALUATION: PASS</code></pre>
           <tr><td>속도가 지나치게 빠름</td><td><code>max_linear_speed</code>, <code>max_linear_accel</code> 감소</td></tr>
           <tr><td>회전이 심하게 출렁임</td><td>최대 각속도 감소 또는 DWA 회전 페널티 증가</td></tr>
           <tr><td>움직이는 사람의 흔적이 오래 남음</td><td><code>stale_hit_steps</code> 또는 <code>stale_decay</code> 감소</td></tr>
+          <tr><td>동적 물체를 늦게 회피</td><td><code>confirmation_hits</code>, <code>prediction_horizon</code>, <code>emergency_surface_distance</code> 조정</td></tr>
+          <tr><td>정적 물체를 사람으로 오인</td><td><code>moving_speed</code>, cluster 폭, 정적 지도 중첩 기준 조정</td></tr>
           <tr><td>복도에서 위치가 점프</td><td>scan matching improvement gate 증가</td></tr>
           <tr><td>scan matching이 거의 거절됨</td><td>gate를 조금 낮추고 반복 복도 점프 여부 재검사</td></tr>
         </tbody>

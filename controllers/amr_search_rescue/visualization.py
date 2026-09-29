@@ -5,7 +5,7 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 
 from mapping import OccupancyGrid
-from models import Pose2D
+from models import DynamicObstacle, Pose2D
 
 
 class MapDisplay:
@@ -18,6 +18,7 @@ class MapDisplay:
         pose: Pose2D,
         path: Sequence[Tuple[float, float]],
         goal: Optional[Tuple[float, float]],
+        dynamic_obstacles: Sequence[DynamicObstacle] = (),
     ) -> None:
         if self.display is None:
             return
@@ -47,6 +48,13 @@ class MapDisplay:
             gx, gy = grid.world_to_grid(*goal)
             self.display.setColor(0x00FF33)
             self.display.fillOval(gx, height - 1 - gy, 3, 3)
+        self.display.setColor(0xFF8C00)
+        for obstacle in dynamic_obstacles:
+            ox, oy = grid.world_to_grid(obstacle.x, obstacle.y)
+            px, py = grid.world_to_grid(obstacle.x + obstacle.vx, obstacle.y + obstacle.vy)
+            radius = max(2, int(round(obstacle.radius / grid.resolution)))
+            self.display.drawOval(ox, height - 1 - oy, radius, radius)
+            self.display.drawLine(ox, height - 1 - oy, px, height - 1 - py)
         rx, ry = grid.world_to_grid(pose.x, pose.y)
         self.display.setColor(0xFF3030)
         self.display.fillOval(rx, height - 1 - ry, 3, 3)

@@ -26,6 +26,7 @@ class MissionManager:
         self.visited_targets: list[WorldPoint] = []
         self.last_confirmed_pose: Optional[Pose2D] = None
         self.last_target_time = -math.inf
+        self.target_observation_accepted = False
         self.transition_message = ""
 
     @property
@@ -47,8 +48,46 @@ class MissionManager:
         self.phase_started_at = now
         self.transition_message = f"{old.name} -> {phase.name}: {reason}"
 
+    def _matches_visited_target(
+        self,
+        pose: Pose2D,
+        detection: TargetDetection,
+        object_observation: Optional[WorldPoint],
+    ) -> bool:
+        if not self.visited_targets:
+            return False
+        if object_observation is not None and any(
+            math.hypot(object_observation[0] - target[0], object_observation[1] - target[1])
+            <= self.config.target_dedup_distance
+            for target in self.visited_targets
+        ):
+            return True
+
+        # Bearing is meaningful only while the camera is actively observing a
+        # target.  During a one-frame dropout TargetDetection carries its
+        # default zero bearing, which must not reject a valid in-progress
+        # approach by accident.
+        if not detection.seen:
+            return False
+
+        bearing_gate = math.radians(self.config.target_dedup_bearing_deg)
+        for target in self.visited_targets:
+            predicted_bearing = angle_difference(
+                math.atan2(target[1] - pose.y, target[0] - pose.x),
+                pose.theta,
+            )
+            if abs(angle_difference(detection.bearing, predicted_bearing)) <= bearing_gate:
+                return True
+        return False
+
+    def _clear_target_candidate(self) -> None:
+        self.target_estimate = None
+        self.target_object_estimate = None
+        self._target_frames = 0
+
     def update(self, now: float, pose: Pose2D, detection: TargetDetection) -> Optional[str]:
         self.transition_message = ""
+        self.target_observation_accepted = False
         delta_theta = abs(angle_difference(pose.theta, self._last_theta))
         self._last_theta = pose.theta
 
@@ -60,19 +99,33 @@ class MissionManager:
                 pose.x + detection.range_m * math.cos(angle),
                 pose.y + detection.range_m * math.sin(angle),
             )
-            already_visited = any(
-                math.hypot(object_observation[0] - target[0], object_observation[1] - target[1])
-                <= self.config.target_dedup_distance
-                for target in self.visited_targets
-            )
+            already_visited = self._matches_visited_target(pose, detection, object_observation)
             rearmed = self.last_confirmed_pose is None or math.hypot(
                 pose.x - self.last_confirmed_pose.x,
                 pose.y - self.last_confirmed_pose.y,
             ) >= self.config.target_rearm_distance
-            accept_detection = self.phase in (
-                MissionPhase.TARGET_APPROACH,
-                MissionPhase.CONFIRM_TARGET,
-            ) or (not already_visited and rearmed)
+
+            associated_with_candidate = True
+            if (
+                self.phase in (MissionPhase.TARGET_APPROACH, MissionPhase.CONFIRM_TARGET)
+                and self.target_object_estimate is not None
+            ):
+                expected_bearing = angle_difference(
+                    math.atan2(
+                        self.target_object_estimate[1] - pose.y,
+                        self.target_object_estimate[0] - pose.x,
+                    ),
+                    pose.theta,
+                )
+                associated_with_candidate = abs(
+                    angle_difference(detection.bearing, expected_bearing)
+                ) <= math.radians(self.config.target_track_bearing_deg)
+
+            if self.phase in (MissionPhase.TARGET_APPROACH, MissionPhase.CONFIRM_TARGET):
+                accept_detection = associated_with_candidate and not already_visited
+            else:
+                accept_detection = not already_visited and rearmed
+            self.target_observation_accepted = accept_detection
 
         if accept_detection and object_observation is not None:
             self._target_frames += 1
@@ -108,18 +161,23 @@ class MissionManager:
                 self._transition(MissionPhase.EXPLORE, now, "initial 360-degree scan complete")
 
         if self.phase == MissionPhase.EXPLORE and self._target_frames >= self.config.target_stable_frames:
-            self._transition(MissionPhase.TARGET_APPROACH, now, "visual target confirmed")
+            if self._matches_visited_target(pose, detection, self.target_object_estimate):
+                self._clear_target_candidate()
+            else:
+                self._transition(MissionPhase.TARGET_APPROACH, now, "visual target confirmed")
 
         if self.phase == MissionPhase.TARGET_APPROACH:
-            if detection.seen and detection.range_m is not None and detection.range_m <= self.config.target_stop_distance + 0.05:
+            if (
+                accept_detection
+                and detection.range_m is not None
+                and detection.range_m <= self.config.target_stop_distance + 0.05
+            ):
                 self._transition(MissionPhase.CONFIRM_TARGET, now, "target stand-off reached")
             elif (
                 self.target_estimate is not None
                 and now - self.last_target_time > self.config.target_reacquire_timeout
             ):
-                self.target_estimate = None
-                self.target_object_estimate = None
-                self._target_frames = 0
+                self._clear_target_candidate()
                 self._transition(MissionPhase.EXPLORE, now, "target observation lost; resume search")
 
         if self.phase == MissionPhase.CONFIRM_TARGET:
@@ -143,9 +201,7 @@ class MissionManager:
                     )
                 else:
                     confirmed = self.visited_count
-                    self.target_estimate = None
-                    self.target_object_estimate = None
-                    self._target_frames = 0
+                    self._clear_target_candidate()
                     self._transition(
                         MissionPhase.EXPLORE,
                         now,

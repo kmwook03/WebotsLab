@@ -7,9 +7,19 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from config import PlannerConfig, RobotConfig
+from collision import predict_dynamic_clearance
+from config import DynamicObstacleConfig, PlannerConfig, RobotConfig
 from mapping import GridCell, OccupancyGrid
-from models import ControlCommand, LaserScan, PlanResult, Pose2D, Velocity, angle_difference, transform_points
+from models import (
+    ControlCommand,
+    DynamicObstacle,
+    LaserScan,
+    PlanResult,
+    Pose2D,
+    Velocity,
+    angle_difference,
+    transform_points,
+)
 
 
 WorldPoint = Tuple[float, float]
@@ -178,9 +188,15 @@ class FrontierExplorer:
 class DynamicWindowPlanner:
     """Acceleration-constrained critic-based local planner."""
 
-    def __init__(self, robot: RobotConfig, config: PlannerConfig):
+    def __init__(
+        self,
+        robot: RobotConfig,
+        config: PlannerConfig,
+        dynamic_config: DynamicObstacleConfig,
+    ):
         self.robot = robot
         self.config = config
+        self.dynamic_config = dynamic_config
 
     @staticmethod
     def _lookahead(path: Sequence[WorldPoint], pose: Pose2D, distance: float) -> WorldPoint:
@@ -198,6 +214,8 @@ class DynamicWindowPlanner:
         path: Sequence[WorldPoint],
         scan: LaserScan,
         control_dt: float,
+        dynamic_obstacles: Sequence[DynamicObstacle],
+        now: float,
     ) -> ControlCommand:
         if not path:
             return ControlCommand(0.0, 0.55, "no-path search")
@@ -217,7 +235,14 @@ class DynamicWindowPlanner:
         for linear in v_samples:
             for angular in w_samples:
                 score = self._score_trajectory(
-                    pose, float(linear), float(angular), obstacle_world, lookahead, goal
+                    pose,
+                    float(linear),
+                    float(angular),
+                    obstacle_world,
+                    dynamic_obstacles,
+                    lookahead,
+                    goal,
+                    now,
                 )
                 if score > best_score:
                     best_score = score
@@ -235,8 +260,10 @@ class DynamicWindowPlanner:
         linear: float,
         angular: float,
         obstacles: np.ndarray,
+        dynamic_obstacles: Sequence[DynamicObstacle],
         lookahead: WorldPoint,
         goal: WorldPoint,
+        now: float,
     ) -> float:
         x, y, theta = pose.x, pose.y, pose.theta
         min_clearance = 5.0
@@ -254,6 +281,18 @@ class DynamicWindowPlanner:
         braking_distance = linear * linear / max(0.1, 2.0 * self.robot.max_linear_accel)
         if min_clearance < braking_distance + self.robot.robot_radius + self.robot.safety_margin:
             return -math.inf
+        dynamic_prediction = predict_dynamic_clearance(
+            pose,
+            ControlCommand(linear, angular, "DWA candidate"),
+            dynamic_obstacles,
+            self.robot,
+            self.dynamic_config,
+            now,
+            horizon=self.dynamic_config.planning_prediction_horizon,
+            dt=self.config.dwa_dt,
+        )
+        if dynamic_prediction.ttc is not None:
+            return -math.inf
         desired_heading = math.atan2(lookahead[1] - y, lookahead[0] - x)
         heading_score = math.cos(angle_difference(desired_heading, theta))
         old_goal_distance = math.hypot(goal[0] - pose.x, goal[1] - pose.y)
@@ -261,10 +300,14 @@ class DynamicWindowPlanner:
         progress = old_goal_distance - new_goal_distance
         path_distance = math.hypot(lookahead[0] - x, lookahead[1] - y)
         clearance_score = min(min_clearance, 1.0)
+        dynamic_clearance_score = min(dynamic_prediction.min_clearance, 1.0)
+        if not math.isfinite(dynamic_clearance_score):
+            dynamic_clearance_score = 1.0
         return (
             3.2 * progress
             + 1.45 * heading_score
             + 1.05 * clearance_score
+            + 1.20 * dynamic_clearance_score
             + 0.45 * linear / max(0.01, self.robot.max_linear_speed)
             - 0.65 * path_distance
             - 0.05 * abs(angular)
