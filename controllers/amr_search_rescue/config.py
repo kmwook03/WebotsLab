@@ -148,8 +148,15 @@ class MissionConfig:
     target_confirm_time: float = 1.2
     home_tolerance: float = 0.24
     target_reacquire_timeout: float = 9.0
-    mission_timeout: float = 360.0
+    # The independent evaluator ends at 440 s. Start a fail-safe return 40 s
+    # earlier so a distant robot still has time to reach the start area.
+    evaluation_time_limit: float = 440.0
+    return_time_reserve: float = 40.0
     status_period: float = 2.0
+
+    @property
+    def mission_timeout(self) -> float:
+        return self.evaluation_time_limit - self.return_time_reserve
 
 
 @dataclass(frozen=True)
@@ -177,6 +184,8 @@ class SafetyConfig:
     front_escape_activation_time: float = 5.0
     front_escape_episode_window: float = 8.0
     front_escape_anchor_radius: float = 0.20
+    evasive_direction_hold_time: float = 0.85
+    evasive_switch_score_margin: float = 0.24
 
 
 @dataclass(frozen=True)

@@ -2,8 +2,16 @@
 
 import json
 import math
+import os
+from pathlib import Path
 
 from controller import Supervisor
+
+
+TARGET_REACHED_DISTANCE_M = 0.68
+HOME_DISTANCE_LIMIT_M = 0.32
+PERSON_SEPARATION_LIMIT_M = 0.27
+EVALUATION_TIME_LIMIT_S = 440.0
 
 
 class MissionEvaluator:
@@ -28,7 +36,6 @@ class MissionEvaluator:
         self.target_reached = [False for _ in self.targets]
         self.closest_human = math.inf
         self.closest_humans = [math.inf for _ in self.humans]
-        self.reported_pass = False
         self.reported_complete_pose = False
         self.last_phase = "UNKNOWN"
 
@@ -40,6 +47,38 @@ class MissionEvaluator:
     def _triangle(value):
         phase = value % 2.0
         return phase if phase <= 1.0 else 2.0 - phase
+
+    def _finish(self, outcome, reason, now, home_distance, exit_code):
+        """Publish one human-readable and one machine-readable terminal result."""
+        payload = {
+            "outcome": outcome,
+            "reason": reason,
+            "elapsed_s": round(float(now), 3),
+            "phase": self.last_phase,
+            "targets_reached": sum(self.target_reached),
+            "targets_required": len(self.targets),
+            "target_reached_flags": self.target_reached,
+            "target_distance_limit_m": TARGET_REACHED_DISTANCE_M,
+            "home_distance_m": round(float(home_distance), 6),
+            "home_limit_m": HOME_DISTANCE_LIMIT_M,
+            "closest_person_m": round(float(self.closest_human), 6),
+            "closest_people_m": [round(float(value), 6) for value in self.closest_humans],
+            "person_limit_m": PERSON_SEPARATION_LIMIT_M,
+            "time_limit_s": EVALUATION_TIME_LIMIT_S,
+        }
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        print(f"EVALUATION: {outcome} | {reason}", flush=True)
+        print(f"EVALUATION_JSON: {encoded}", flush=True)
+
+        result_path = os.environ.get("AMR_EVALUATION_RESULT_PATH")
+        if result_path:
+            try:
+                Path(result_path).write_text(encoded + "\n", encoding="utf-8")
+            except OSError as error:
+                print(f"[EVALUATOR] unable to write result file: {error}", flush=True)
+
+        self.supervisor.step(self.time_step)
+        self.supervisor.simulationQuit(exit_code)
 
     def run(self):
         print("[EVALUATOR] Ground truth is isolated from the robot controller.")
@@ -91,7 +130,10 @@ class MissionEvaluator:
             ]
 
             for index, target_distance in enumerate(target_distances):
-                if not self.target_reached[index] and target_distance < 0.68:
+                if (
+                    not self.target_reached[index]
+                    and target_distance < TARGET_REACHED_DISTANCE_M
+                ):
                     self.target_reached[index] = True
                     print(f"[EVALUATOR] target {index + 1}/{len(self.targets)} reached at t={now:.1f}s")
 
@@ -99,34 +141,41 @@ class MissionEvaluator:
             if self.last_phase == "COMPLETE" and not self.reported_complete_pose:
                 self.reported_complete_pose = True
                 print(f"[EVALUATOR] controller complete; actual home distance={home_distance:.3f}m")
-            if all(self.target_reached) and home_distance < 0.32 and self.last_phase == "COMPLETE":
-                print(
-                    f"EVALUATION: PASS | all {len(self.targets)} targets reached, returned home, "
+            if (
+                all(self.target_reached)
+                and home_distance < HOME_DISTANCE_LIMIT_M
+                and self.last_phase == "COMPLETE"
+            ):
+                self._finish(
+                    "PASS",
+                    f"all {len(self.targets)} targets reached, returned home, "
                     f"closest moving-person separation={self.closest_human:.3f}m "
                     f"across {len(self.humans)} people",
-                    flush=True,
+                    now,
+                    home_distance,
+                    0,
                 )
-                self.supervisor.step(self.time_step)
-                self.reported_pass = True
-                self.supervisor.simulationQuit(0)
                 return
 
-            if human_distance < 0.27:
+            if human_distance < PERSON_SEPARATION_LIMIT_M:
                 person_index = human_distances.index(human_distance) + 1
-                print(
-                    f"EVALUATION: FAIL | unsafe separation from person {person_index}: "
-                    f"{human_distance:.3f}m",
-                    flush=True,
+                self._finish(
+                    "FAIL",
+                    f"unsafe separation from person {person_index}: {human_distance:.3f}m",
+                    now,
+                    home_distance,
+                    2,
                 )
-                self.supervisor.step(self.time_step)
-                self.supervisor.simulationQuit(2)
                 return
-            if now > 440.0:
-                print(
-                    f"EVALUATION: TIMEOUT | phase={self.last_phase}, "
-                    f"targets_reached={self.target_reached}, home_distance={home_distance:.2f}m"
+            if now > EVALUATION_TIME_LIMIT_S:
+                self._finish(
+                    "TIMEOUT",
+                    f"phase={self.last_phase}, targets_reached={self.target_reached}, "
+                    f"home_distance={home_distance:.2f}m",
+                    now,
+                    home_distance,
+                    3,
                 )
-                self.supervisor.simulationQuit(3)
                 return
 
 

@@ -438,6 +438,89 @@ class LocalPlanningTests(unittest.TestCase):
             (strict_command.linear, strict_command.angular),
         )
 
+    def test_evasive_direction_does_not_flip_on_small_track_jitter(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        scan = LaserScan(
+            np.full(360, np.inf, dtype=np.float32), angles, 0.05, 3.5
+        )
+        supervisor = SafetySupervisor(
+            RobotConfig(), SafetyConfig(), DynamicObstacleConfig()
+        )
+        first_obstacle = DynamicObstacle(
+            1, 0.35, 0.20, -0.25, -0.15, 0.16, 1.0, 0.0
+        )
+        jittered_obstacle = DynamicObstacle(
+            1, 0.35, 0.25, -0.25, -0.15, 0.16, 1.0, 0.064
+        )
+
+        first = supervisor._evasive_command(
+            Pose2D(), scan, (first_obstacle,), 0.0
+        )
+        jittered = supervisor._evasive_command(
+            Pose2D(), scan, (jittered_obstacle,), 0.064
+        )
+        unlatched = SafetySupervisor(
+            RobotConfig(), SafetyConfig(), DynamicObstacleConfig()
+        )._evasive_command(Pose2D(), scan, (jittered_obstacle,), 0.064)
+
+        self.assertLess(first.linear, 0.0)
+        self.assertGreater(unlatched.linear, 0.0)
+        self.assertLess(jittered.linear, 0.0)
+
+    def test_evasive_direction_switches_immediately_when_latched_side_is_blocked(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        clear_scan = LaserScan(
+            np.full(360, np.inf, dtype=np.float32), angles, 0.05, 3.5
+        )
+        supervisor = SafetySupervisor(
+            RobotConfig(), SafetyConfig(), DynamicObstacleConfig()
+        )
+        first_obstacle = DynamicObstacle(
+            1, 0.35, 0.20, -0.25, -0.15, 0.16, 1.0, 0.0
+        )
+        first = supervisor._evasive_command(
+            Pose2D(), clear_scan, (first_obstacle,), 0.0
+        )
+
+        rear_ranges = np.full(360, np.inf, dtype=np.float32)
+        rear_ranges[np.abs(angles) > math.radians(125.0)] = 0.18
+        rear_blocked = LaserScan(rear_ranges, angles, 0.05, 3.5)
+        jittered_obstacle = DynamicObstacle(
+            1, 0.35, 0.25, -0.25, -0.15, 0.16, 1.0, 0.064
+        )
+        switched = supervisor._evasive_command(
+            Pose2D(), rear_blocked, (jittered_obstacle,), 0.064
+        )
+
+        self.assertLess(first.linear, 0.0)
+        self.assertGreater(switched.linear, 0.0)
+
+    def test_evasive_latch_releases_with_safety_override(self):
+        supervisor = SafetySupervisor(
+            RobotConfig(), SafetyConfig(), DynamicObstacleConfig()
+        )
+        supervisor._evasive_linear_direction = -1
+        supervisor._evasive_angular_direction = 1
+        supervisor._evasive_started = 0.0
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        scan = LaserScan(
+            np.full(360, np.inf, dtype=np.float32), angles, 0.05, 3.5
+        )
+
+        supervisor.override_active = True
+        supervisor.safe_since = 0.0
+        released = supervisor.guard(
+            ControlCommand(0.10, 0.0, "test"),
+            scan,
+            Pose2D(),
+            (),
+            1.0,
+        )
+
+        self.assertEqual(released.reason, "test")
+        self.assertEqual(supervisor._evasive_linear_direction, 0)
+        self.assertEqual(supervisor._evasive_angular_direction, 0)
+
     def test_closing_person_inside_margin_uses_best_effort_escape(self):
         angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
         ranges = np.full(360, np.inf, dtype=np.float32)
@@ -873,6 +956,13 @@ class DynamicObstacleTrackingTests(unittest.TestCase):
 
 
 class PerceptionAndMissionTests(unittest.TestCase):
+    def test_mission_deadline_reserves_time_before_evaluator_timeout(self):
+        config = MissionConfig()
+
+        self.assertEqual(config.evaluation_time_limit, 440.0)
+        self.assertEqual(config.return_time_reserve, 40.0)
+        self.assertEqual(config.mission_timeout, 400.0)
+
     def test_traversable_floor_segmentation_and_lidar_alignment(self):
         height, width = 96, 160
         image = np.zeros((height, width, 4), dtype=np.uint8)

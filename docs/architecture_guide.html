@@ -231,7 +231,7 @@
         <span class="badge">Webots R2025a</span>
         <span class="badge">Python + NumPy</span>
         <span class="badge">3인 동적 방해 시나리오</span>
-        <span class="badge ok">단위 테스트 53/53 통과</span>
+        <span class="badge ok">빠른 테스트 59개 통과</span>
       </div>
     </header>
 
@@ -615,7 +615,9 @@ associated range  = 20th percentile of LiDAR returns within ±2.5°</code></pre>
                   + forward speed × TTC horizon</code></pre>
           <p>
             위험 트랙은 ID로 유지하고 충분히 멀어진 뒤에도 짧은 release dwell을 적용해 방향 반전과 센서 가림에
-            의한 재출발 진동을 막는다. 3초간 적용된 제어 명령이 있었지만 3.5cm 미만으로 이동하면 recovery를
+            의한 재출발 진동을 막는다. 회피 중에는 안전한 전후·회전 방향을 최소 0.85초 유지하고, 반대 방향이
+            충분히 더 좋거나 현재 방향이 더 이상 안전하지 않을 때만 전환해 전후진 덜컹거림을 억제한다.
+            3초간 적용된 제어 명령이 있었지만 3.5cm 미만으로 이동하면 recovery를
             수행하며, recovery 명령도 최종 안전검사를 다시 통과한다.
           </p>
         </article>
@@ -632,9 +634,18 @@ py -3.10 -m pip install -r .\requirements.txt</code></pre>
       <h3>5.2 단위 테스트</h3>
       <pre><code>Set-Location 'C:\Users\kmwook\git\WebotsLab'
 py -3.10 -B -m unittest discover -s tests -v</code></pre>
-      <div class="success"><strong>2026-09-30 확인 결과:</strong> 단위 테스트 53개 모두 통과. 비전–LiDAR 융합을 포함한 Webots 배치 smoke test에서 예외 없이 동작했다.</div>
+      <div class="success"><strong>2026-09-30 확인 결과:</strong> 빠른 테스트 59개가 통과하고, 긴 Webots 전체 회귀 1개는 기본 실행에서 제외된다. 전체 회귀는 평가기의 구조화 결과로 3개 표적, 복귀 거리, 사람 최소 거리와 제한 시간을 모두 검사한다.</div>
 
-      <h3>5.3 Webots GUI 실행</h3>
+      <h3>5.3 전체 Webots 회귀 테스트</h3>
+      <pre><code>Set-Location 'C:\Users\kmwook\git\WebotsLab'
+pwsh -NoProfile -File .\tests\run_webots_regression.ps1</code></pre>
+      <p>
+        평가기는 사람이 읽는 <code>EVALUATION</code>과 자동 검증용 <code>EVALUATION_JSON</code>을 함께 남긴다.
+        회귀 실행기는 실제 좌표 기준 3개 표적 방문, <code>COMPLETE</code>, 시작점 거리, 사람 최소 거리,
+        440초 제한과 프로세스 종료 코드를 검증한다. 컨트롤러는 400초에 fail-safe 복귀를 시작해 40초를 남긴다.
+      </p>
+
+      <h3>5.4 Webots GUI 실행</h3>
       <ol>
         <li>Webots 실행</li>
         <li><strong>File → Open World</strong></li>
@@ -642,14 +653,14 @@ py -3.10 -B -m unittest discover -s tests -v</code></pre>
         <li>Reset 후 재생 버튼 실행</li>
       </ol>
 
-      <h3>5.4 명령행 실행</h3>
+      <h3>5.5 명령행 실행</h3>
       <pre><code>Set-Location 'C:\Users\kmwook\git\WebotsLab'
 
 &amp; 'C:\Program Files\Webots\msys64\mingw64\bin\webots.exe' `
   --batch --mode=fast --stdout --stderr `
   '.\worlds\amr_search_rescue.wbt'</code></pre>
 
-      <h3>5.5 정상 로그 순서</h3>
+      <h3>5.6 정상 로그 순서</h3>
       <pre><code>[MISSION] autonomous stack online
 [MISSION] BOOTSTRAP -&gt; EXPLORE
 [MISSION] EXPLORE -&gt; TARGET_APPROACH
@@ -741,6 +752,7 @@ EVALUATION: PASS</code></pre>
           <tr><td>좁은 통로 진입 불가</td><td><code>inflation_radius</code>를 조금 감소</td></tr>
           <tr><td>속도가 지나치게 빠름</td><td><code>max_linear_speed</code>, <code>max_linear_accel</code> 감소</td></tr>
           <tr><td>회전이 심하게 출렁임</td><td>최대 각속도 감소 또는 DWA 회전 페널티 증가</td></tr>
+          <tr><td>회피 중 앞뒤로 반복 전환</td><td><code>evasive_direction_hold_time</code> 또는 <code>evasive_switch_score_margin</code> 증가</td></tr>
           <tr><td>바닥 색 때문에 경로가 과도하게 꺾임</td><td><code>visual_traversability_weight</code> 또는 비전 색상 threshold 감소</td></tr>
           <tr><td>보이는 장애물 방향을 충분히 피하지 않음</td><td>카메라–LiDAR 방위 정렬 확인 후 <code>visual_traversability_weight</code> 증가</td></tr>
           <tr><td>움직이는 사람의 흔적이 오래 남음</td><td><code>stale_hit_steps</code> 또는 <code>stale_decay</code> 감소</td></tr>
@@ -807,6 +819,10 @@ EVALUATION: PASS</code></pre>
         <article class="mini">
           <h3>Recovery가 반복됨</h3>
           <p>통로가 팽창 장애물에 의해 막혔는지 확인하고 속도, inflation과 stuck 기준을 함께 검토한다.</p>
+        </article>
+        <article class="mini">
+          <h3>한자리에서 전후진이 반복됨</h3>
+          <p>동적 트랙 위치·속도 흔들림으로 회피 후보가 바뀌는지 로그를 확인한다. 방향 유지 시간을 늘리되 실제로 막힌 방향은 즉시 해제되는지 함께 시험한다.</p>
         </article>
       </div>
     </section>

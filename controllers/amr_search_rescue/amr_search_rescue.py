@@ -199,6 +199,15 @@ class AutonomousSearchAndRescue:
         self.return_force_detour = False
         self.return_progress.reset()
 
+    def _clear_return_detour(self) -> None:
+        self.return_detour_waypoint = None
+        self.return_detour_active = False
+
+    def _clear_return_route_overrides(self) -> None:
+        """Drop direct-approach and temporary-detour state, but keep breadcrumbs."""
+        self.return_direct_approach = False
+        self._clear_return_detour()
+
     def _apply_return_breadcrumb(self) -> Optional[Tuple[float, float]]:
         if self.mission.phase != MissionPhase.RETURN_HOME or len(self.breadcrumbs) < 2:
             self.return_breadcrumb_active = False
@@ -225,8 +234,7 @@ class AutonomousSearchAndRescue:
                 self.return_breadcrumb_next_index = target_index - 1
                 self.return_breadcrumb_target_index = None
                 self.return_breadcrumb_path = []
-                self.return_detour_waypoint = None
-                self.return_detour_active = False
+                self._clear_return_detour()
                 self.return_progress.reset()
                 target_index = None
 
@@ -271,9 +279,7 @@ class AutonomousSearchAndRescue:
         periodic = now - self.last_plan_time >= CONFIG.planner.replan_period
 
         if phase == MissionPhase.EXPLORE:
-            self.return_direct_approach = False
-            self.return_detour_waypoint = None
-            self.return_detour_active = False
+            self._clear_return_route_overrides()
             reached = self.frontier_goal is not None and math.hypot(
                 pose.x - self.frontier_goal[0], pose.y - self.frontier_goal[1]
             ) < CONFIG.planner.frontier_reached_distance
@@ -305,9 +311,7 @@ class AutonomousSearchAndRescue:
         if desired is None:
             self.path = []
             self.current_goal = None
-            self.return_direct_approach = False
-            self.return_detour_waypoint = None
-            self.return_detour_active = False
+            self._clear_return_route_overrides()
             return
         endpoint_reached = self.path and math.hypot(
             pose.x - self.path[-1][0], pose.y - self.path[-1][1]
@@ -338,8 +342,7 @@ class AutonomousSearchAndRescue:
         if self.mission.phase != MissionPhase.RETURN_HOME or not (
             self.return_direct_approach or self.return_breadcrumb_active
         ):
-            self.return_detour_waypoint = None
-            self.return_detour_active = False
+            self._clear_return_detour()
             return
         desired = requested_goal or self.mission.goal(self.frontier_goal)
         if desired is None:

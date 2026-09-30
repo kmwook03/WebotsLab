@@ -51,6 +51,98 @@ class SafetySupervisor:
         self._front_stop_first_episode = -math.inf
         self._front_stop_last_episode = -math.inf
         self._front_stop_anchor: tuple[float, float] | None = None
+        self._evasive_linear_direction = 0
+        self._evasive_angular_direction = 0
+        self._evasive_started = -math.inf
+
+    def _reject_pretrack_candidate(self) -> bool:
+        """Clear temporal confirmation state and reject the current frame."""
+        self._pretrack_candidate_streak = 0
+        self._previous_pretrack_candidates = None
+        return False
+
+    def _reset_front_stop_tracking(self) -> None:
+        self._front_stop_latched = False
+        self._front_stop_episode_count = 0
+        self._front_stop_first_episode = -math.inf
+        self._front_stop_anchor = None
+
+    @staticmethod
+    def _motion_direction(value: float, threshold: float = 0.05) -> int:
+        if value > threshold:
+            return 1
+        if value < -threshold:
+            return -1
+        return 0
+
+    def _reset_evasive_direction(self) -> None:
+        self._evasive_linear_direction = 0
+        self._evasive_angular_direction = 0
+        self._evasive_started = -math.inf
+
+    def _select_consistent_evasive(
+        self,
+        scored_candidates,
+        preferred_entry,
+        now: float,
+    ) -> ControlCommand:
+        """Keep an escape direction unless it becomes unsafe or clearly worse.
+
+        LiDAR cluster association and velocity estimates move slightly between
+        frames. Without hysteresis those small changes can alternate the best
+        rollout between full forward and full reverse every control cycle.
+        Only candidates already accepted by the caller are considered here,
+        so the latch never preserves a direction after it becomes unsafe.
+        """
+        selected_entry = preferred_entry
+        if self._evasive_linear_direction or self._evasive_angular_direction:
+            consistent = []
+            for entry in scored_candidates:
+                candidate = entry[-1]
+                linear_direction = self._motion_direction(candidate.linear)
+                angular_direction = self._motion_direction(candidate.angular)
+                if (
+                    self._evasive_linear_direction
+                    and linear_direction != self._evasive_linear_direction
+                ):
+                    continue
+                if (
+                    self._evasive_angular_direction
+                    and angular_direction not in (0, self._evasive_angular_direction)
+                ):
+                    continue
+                consistent.append(entry)
+            if consistent:
+                sustained_entry = max(consistent, key=lambda item: item[0])
+                minimum_hold_active = (
+                    now - self._evasive_started
+                    < self.config.evasive_direction_hold_time
+                )
+                sustained_is_competitive = (
+                    sustained_entry[0] + self.config.evasive_switch_score_margin
+                    >= preferred_entry[0]
+                )
+                if minimum_hold_active or sustained_is_competitive:
+                    selected_entry = sustained_entry
+
+        selected = selected_entry[-1]
+        linear_direction = self._motion_direction(selected.linear)
+        angular_direction = self._motion_direction(selected.angular)
+        direction_changed = (
+            linear_direction != self._evasive_linear_direction
+            or (
+                angular_direction
+                and angular_direction != self._evasive_angular_direction
+            )
+        )
+        if linear_direction or angular_direction:
+            if direction_changed:
+                self._evasive_started = now
+            self._evasive_linear_direction = linear_direction
+            self._evasive_angular_direction = angular_direction
+        elif now - self._evasive_started >= self.config.evasive_direction_hold_time:
+            self._reset_evasive_direction()
+        return selected
 
     def _register_front_stop_episode(self, pose: Pose2D, now: float) -> bool:
         """Recognise a persistent front-stop loop in one small map region."""
@@ -134,22 +226,14 @@ class SafetySupervisor:
         self._previous_scan_time = now
 
         if previous_ranges is None or previous_time is None:
-            self._pretrack_candidate_streak = 0
-            self._previous_pretrack_candidates = None
-            return False
+            return self._reject_pretrack_candidate()
         if previous_ranges.shape != current_ranges.shape:
-            self._pretrack_candidate_streak = 0
-            self._previous_pretrack_candidates = None
-            return False
+            return self._reject_pretrack_candidate()
         elapsed = now - previous_time
         if elapsed <= 1e-6 or elapsed > self.config.pretrack_max_interval:
-            self._pretrack_candidate_streak = 0
-            self._previous_pretrack_candidates = None
-            return False
+            return self._reject_pretrack_candidate()
         if abs(velocity.angular) > self.config.pretrack_max_angular_speed:
-            self._pretrack_candidate_streak = 0
-            self._previous_pretrack_candidates = None
-            return False
+            return self._reject_pretrack_candidate()
 
         current_valid = scan.valid_mask(include_max_range=False)
         previous_valid = (
@@ -171,9 +255,7 @@ class SafetySupervisor:
             & (residual_closing < self.config.pretrack_max_closing_speed)
         )
         if not np.any(candidates):
-            self._pretrack_candidate_streak = 0
-            self._previous_pretrack_candidates = None
-            return False
+            return self._reject_pretrack_candidate()
 
         run = 0
         longest_run = 0
@@ -197,9 +279,7 @@ class SafetySupervisor:
                 trailing += 1
             longest_run = max(longest_run, leading + trailing)
         if longest_run < self.config.pretrack_min_points:
-            self._pretrack_candidate_streak = 0
-            self._previous_pretrack_candidates = None
-            return False
+            return self._reject_pretrack_candidate()
 
         previous_candidates = self._previous_pretrack_candidates
         self._previous_pretrack_candidates = candidates.copy()
@@ -374,16 +454,22 @@ class SafetySupervisor:
             # not automatically safe: a person may continue walking into the
             # stationary robot. Select the statically valid command that opens
             # the greatest predicted separation by the end of the escape.
-            return max(best_effort_candidates, key=lambda item: item[0])[3]
-        best_score, _, _, best = max(safe_candidates, key=lambda item: item[0])
+            preferred_entry = max(best_effort_candidates, key=lambda item: item[0])
+            return self._select_consistent_evasive(
+                best_effort_candidates, preferred_entry, now
+            )
+        preferred_entry = max(safe_candidates, key=lambda item: item[0])
+        best_score, _, _, best = preferred_entry
         stop_entry = next(
             (item for item in safe_candidates if item[3].reason == "predictive safety stop"),
             None,
         )
         stop_score = -math.inf if stop_entry is None else stop_entry[0]
-        if best.reason != "predictive safety stop" and best_score >= stop_score + 0.03:
-            return best
-        return candidates[0]
+        if best.reason == "predictive safety stop" or best_score < stop_score + 0.03:
+            preferred_entry = stop_entry or preferred_entry
+        return self._select_consistent_evasive(
+            safe_candidates, preferred_entry, now
+        )
 
     def guard(
         self,
@@ -444,10 +530,7 @@ class SafetySupervisor:
                 self._register_front_stop_episode(pose, now) if front_only else False
             )
             if not front_only:
-                self._front_stop_latched = False
-                self._front_stop_episode_count = 0
-                self._front_stop_first_episode = -math.inf
-                self._front_stop_anchor = None
+                self._reset_front_stop_tracking()
             self._active_release_dwell = (
                 self.config.pretrack_release_dwell
                 if pretrack_only
@@ -489,9 +572,11 @@ class SafetySupervisor:
             self.last_override_reason = "+".join(reasons)
             if pretrack_only:
                 self._front_escape_active = False
+                self._reset_evasive_direction()
                 return ControlCommand(0.0, 0.0, "pretrack safety stop")
             if front_escape_ready:
                 if not self._front_escape_active:
+                    self._reset_evasive_direction()
                     self._start_front_escape(scan, now)
                 if now - self._front_escape_started <= self.config.front_escape_max_duration:
                     return self._front_escape_command()
@@ -531,6 +616,11 @@ class SafetySupervisor:
                 self._front_escape_active = False
                 self.safe_since = None
                 self.last_override_reason = "tracked hazard yield"
+                # A completely occluded hazard is intentionally handled by a
+                # stop-and-observe hold. Do not let a previously latched
+                # translational escape continue without a visible track.
+                if missing_hazard and not tracked_hazards:
+                    self._reset_evasive_direction()
                 return self._evasive_command(pose, scan, tracked_hazards, now)
             if self._front_escape_active:
                 escape_elapsed = now - self._front_escape_started
@@ -544,9 +634,7 @@ class SafetySupervisor:
                     self.last_override_reason = "front escape turn"
                     return self._front_escape_command()
                 self._front_escape_active = False
-                self._front_stop_episode_count = 0
-                self._front_stop_first_episode = -math.inf
-                self._front_stop_anchor = None
+                self._reset_front_stop_tracking()
                 self.safe_since = now
             if self.safe_since is None:
                 self.safe_since = now
@@ -557,7 +645,10 @@ class SafetySupervisor:
             self.safe_since = None
             self.hazard_track_ids.clear()
             self._front_escape_active = False
+            self._reset_evasive_direction()
         self.last_override_reason = ""
+        if not self.override_active:
+            self._reset_evasive_direction()
         return command
 
     def is_stuck(self, now: float, pose: Pose2D, command: ControlCommand) -> bool:

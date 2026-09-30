@@ -8,6 +8,7 @@ from models import MissionPhase, Pose2D, TargetDetection, angle_difference
 
 
 WorldPoint = Tuple[float, float]
+TARGET_TRACKING_PHASES = (MissionPhase.TARGET_APPROACH, MissionPhase.CONFIRM_TARGET)
 
 
 class MissionManager:
@@ -56,11 +57,7 @@ class MissionManager:
     ) -> bool:
         if not self.visited_targets:
             return False
-        if object_observation is not None and any(
-            math.hypot(object_observation[0] - target[0], object_observation[1] - target[1])
-            <= self.config.target_dedup_distance
-            for target in self.visited_targets
-        ):
+        if object_observation is not None and self._is_near_visited(object_observation):
             return True
 
         # Bearing is meaningful only while the camera is actively observing a
@@ -80,10 +77,98 @@ class MissionManager:
                 return True
         return False
 
+    def _is_near_visited(self, point: WorldPoint) -> bool:
+        return any(
+            math.hypot(point[0] - target[0], point[1] - target[1])
+            <= self.config.target_dedup_distance
+            for target in self.visited_targets
+        )
+
+    @staticmethod
+    def _project(pose: Pose2D, bearing: float, distance: float) -> WorldPoint:
+        angle = pose.theta + bearing
+        return (
+            pose.x + distance * math.cos(angle),
+            pose.y + distance * math.sin(angle),
+        )
+
+    @staticmethod
+    def _smooth(previous: WorldPoint, observed: WorldPoint) -> WorldPoint:
+        return (
+            0.68 * previous[0] + 0.32 * observed[0],
+            0.68 * previous[1] + 0.32 * observed[1],
+        )
+
     def _clear_target_candidate(self) -> None:
         self.target_estimate = None
         self.target_object_estimate = None
         self._target_frames = 0
+
+    def _evaluate_detection(
+        self,
+        pose: Pose2D,
+        detection: TargetDetection,
+    ) -> Tuple[bool, Optional[WorldPoint]]:
+        """Associate a visible target with the current candidate or reject it."""
+        if not detection.seen or detection.range_m is None:
+            return False, None
+
+        observation = self._project(pose, detection.bearing, detection.range_m)
+        already_visited = self._matches_visited_target(pose, detection, observation)
+        rearmed = self.last_confirmed_pose is None or math.hypot(
+            pose.x - self.last_confirmed_pose.x,
+            pose.y - self.last_confirmed_pose.y,
+        ) >= self.config.target_rearm_distance
+
+        associated = True
+        if (
+            self.phase in TARGET_TRACKING_PHASES
+            and self.target_object_estimate is not None
+        ):
+            expected_bearing = angle_difference(
+                math.atan2(
+                    self.target_object_estimate[1] - pose.y,
+                    self.target_object_estimate[0] - pose.x,
+                ),
+                pose.theta,
+            )
+            associated = abs(
+                angle_difference(detection.bearing, expected_bearing)
+            ) <= math.radians(self.config.target_track_bearing_deg)
+
+        if self.phase in TARGET_TRACKING_PHASES:
+            return associated and not already_visited, observation
+        return not already_visited and rearmed, observation
+
+    def _update_target_candidate(
+        self,
+        now: float,
+        pose: Pose2D,
+        detection: TargetDetection,
+        accepted: bool,
+        object_observation: Optional[WorldPoint],
+    ) -> None:
+        if not accepted or object_observation is None:
+            self._target_frames = max(0, self._target_frames - 1)
+            return
+
+        assert detection.range_m is not None
+        self._target_frames += 1
+        self.last_target_time = now
+        stand_off = max(0.0, detection.range_m - self.config.target_stop_distance)
+        approach_observation = self._project(pose, detection.bearing, stand_off)
+        if self.target_estimate is None:
+            self.target_estimate = approach_observation
+            self.target_object_estimate = object_observation
+            return
+
+        self.target_estimate = self._smooth(
+            self.target_estimate, approach_observation
+        )
+        assert self.target_object_estimate is not None
+        self.target_object_estimate = self._smooth(
+            self.target_object_estimate, object_observation
+        )
 
     def update(self, now: float, pose: Pose2D, detection: TargetDetection) -> Optional[str]:
         self.transition_message = ""
@@ -91,66 +176,11 @@ class MissionManager:
         delta_theta = abs(angle_difference(pose.theta, self._last_theta))
         self._last_theta = pose.theta
 
-        accept_detection = False
-        object_observation: Optional[WorldPoint] = None
-        if detection.seen and detection.range_m is not None:
-            angle = pose.theta + detection.bearing
-            object_observation = (
-                pose.x + detection.range_m * math.cos(angle),
-                pose.y + detection.range_m * math.sin(angle),
-            )
-            already_visited = self._matches_visited_target(pose, detection, object_observation)
-            rearmed = self.last_confirmed_pose is None or math.hypot(
-                pose.x - self.last_confirmed_pose.x,
-                pose.y - self.last_confirmed_pose.y,
-            ) >= self.config.target_rearm_distance
-
-            associated_with_candidate = True
-            if (
-                self.phase in (MissionPhase.TARGET_APPROACH, MissionPhase.CONFIRM_TARGET)
-                and self.target_object_estimate is not None
-            ):
-                expected_bearing = angle_difference(
-                    math.atan2(
-                        self.target_object_estimate[1] - pose.y,
-                        self.target_object_estimate[0] - pose.x,
-                    ),
-                    pose.theta,
-                )
-                associated_with_candidate = abs(
-                    angle_difference(detection.bearing, expected_bearing)
-                ) <= math.radians(self.config.target_track_bearing_deg)
-
-            if self.phase in (MissionPhase.TARGET_APPROACH, MissionPhase.CONFIRM_TARGET):
-                accept_detection = associated_with_candidate and not already_visited
-            else:
-                accept_detection = not already_visited and rearmed
-            self.target_observation_accepted = accept_detection
-
-        if accept_detection and object_observation is not None:
-            self._target_frames += 1
-            self.last_target_time = now
-            angle = pose.theta + detection.bearing
-            stand_off = max(0.0, detection.range_m - self.config.target_stop_distance)
-            observation = (
-                pose.x + stand_off * math.cos(angle),
-                pose.y + stand_off * math.sin(angle),
-            )
-            if self.target_estimate is None:
-                self.target_estimate = observation
-                self.target_object_estimate = object_observation
-            else:
-                self.target_estimate = (
-                    0.68 * self.target_estimate[0] + 0.32 * observation[0],
-                    0.68 * self.target_estimate[1] + 0.32 * observation[1],
-                )
-                assert self.target_object_estimate is not None
-                self.target_object_estimate = (
-                    0.68 * self.target_object_estimate[0] + 0.32 * object_observation[0],
-                    0.68 * self.target_object_estimate[1] + 0.32 * object_observation[1],
-                )
-        else:
-            self._target_frames = max(0, self._target_frames - 1)
+        accept_detection, object_observation = self._evaluate_detection(pose, detection)
+        self.target_observation_accepted = accept_detection
+        self._update_target_candidate(
+            now, pose, detection, accept_detection, object_observation
+        )
 
         if self.phase == MissionPhase.BOOTSTRAP:
             self._rotation_accumulated += delta_theta
@@ -182,13 +212,9 @@ class MissionManager:
 
         if self.phase == MissionPhase.CONFIRM_TARGET:
             if now - self.phase_started_at >= self.config.target_confirm_time:
-                if self.target_object_estimate is not None and not any(
-                    math.hypot(
-                        self.target_object_estimate[0] - target[0],
-                        self.target_object_estimate[1] - target[1],
-                    )
-                    <= self.config.target_dedup_distance
-                    for target in self.visited_targets
+                if (
+                    self.target_object_estimate is not None
+                    and not self._is_near_visited(self.target_object_estimate)
                 ):
                     self.visited_targets.append(self.target_object_estimate)
                     self.last_confirmed_pose = Pose2D(pose.x, pose.y, pose.theta)

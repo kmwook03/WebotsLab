@@ -36,7 +36,7 @@ robotics:
    stricter confirmed track is used for mapping and telemetry; short occlusions
    are projected forward from the last observation time.
 7. **Safety and mission** - an independent predictive TTC guard, scored
-   emergency manoeuvres, release hysteresis, stuck recovery,
+   emergency manoeuvres, escape-direction hysteresis, release hysteresis, stuck recovery,
    visited-target position/bearing de-duplication, and an explicit `BOOTSTRAP ->
    EXPLORE -> TARGET_APPROACH -> CONFIRM_TARGET` loop followed by `RETURN_HOME ->
    COMPLETE` after all three unique targets are confirmed. A locked approach
@@ -65,6 +65,18 @@ Expected controller milestones are printed as `[MISSION] ...`. The independent
 supervisor prints `EVALUATION: PASS` after all three target arrivals and safe
 return.
 
+The complete Windows end-to-end regression is:
+
+```powershell
+pwsh -NoProfile -File .\tests\run_webots_regression.ps1
+```
+
+The evaluator writes a structured `EVALUATION_JSON` result. The regression
+checks all three target visits, `COMPLETE` phase, actual home distance, minimum
+person separation, the 440 s simulation deadline, and the Webots exit status.
+The controller starts its fail-safe return at 400 s, preserving a 40 s return
+reserve before the evaluator deadline.
+
 ## Tests
 
 From this directory, with NumPy available:
@@ -75,7 +87,7 @@ python -m unittest discover -s tests -v
 
 The tests cover geometry, occupancy updates, A* around an obstacle, frontier
 selection, RGB floor segmentation, camera/LiDAR bearing association,
-dynamic-cluster tracking, predicted crossing rejection, safety
+dynamic-cluster tracking, predicted crossing rejection, evasive-direction stability, safety
 hysteresis, dynamic-map exclusion, target detection, visited-target rejection,
 target-lock continuity, and mission transitions.
 
