@@ -18,10 +18,11 @@ from models import (
     LaserScan,
     MissionPhase,
     TargetDetection,
+    TraversabilityFrame,
     angle_difference,
     wrap_angle,
 )
-from perception import RedTargetDetector
+from perception import RedTargetDetector, TraversableAreaDetector
 from planning import (
     AStarPlanner,
     DynamicWindowPlanner,
@@ -75,6 +76,7 @@ class AutonomousSearchAndRescue:
         self.grid = OccupancyGrid(CONFIG.mapping)
         self.estimator = PoseEstimator(CONFIG.robot)
         self.target_detector = RedTargetDetector(CONFIG.target)
+        self.traversability_detector = TraversableAreaDetector(CONFIG.traversability)
         self.global_planner = AStarPlanner(CONFIG.planner)
         self.explorer = FrontierExplorer(CONFIG.planner, self.global_planner)
         self.local_planner = DynamicWindowPlanner(CONFIG.robot, CONFIG.planner, CONFIG.dynamic)
@@ -85,10 +87,12 @@ class AutonomousSearchAndRescue:
 
         self.path: List[Tuple[float, float]] = []
         self.frontier_goal: Optional[Tuple[float, float]] = None
+        self.retired_frontiers: List[Tuple[float, float, float]] = []
         self.current_goal: Optional[Tuple[float, float]] = None
         self.last_plan_time = -math.inf
         self.last_status_time = -math.inf
         self.last_detection = TargetDetection()
+        self.traversability_frame = TraversabilityFrame.empty()
         self.last_command = ControlCommand()
         self.fallback_heading: Optional[float] = None
         self.fallback_until = -math.inf
@@ -114,14 +118,18 @@ class AutonomousSearchAndRescue:
         ranges = np.asarray(self.lidar.getRangeImage(), dtype=np.float32)
         return LaserScan(ranges, self.lidar_angles, self.lidar_min_range, self.lidar_max_range)
 
-    def _detection(self, scan: LaserScan) -> TargetDetection:
-        return self.target_detector.detect(
-            self.camera.getImage(),
-            self.camera.getWidth(),
-            self.camera.getHeight(),
-            self.camera.getFov(),
-            scan,
+    def _perception(self, scan: LaserScan) -> Tuple[TargetDetection, TraversabilityFrame]:
+        image = self.camera.getImage()
+        width = self.camera.getWidth()
+        height = self.camera.getHeight()
+        field_of_view = self.camera.getFov()
+        target = self.target_detector.detect(
+            image, width, height, field_of_view, scan
         )
+        traversability = self.traversability_detector.detect(
+            image, width, height, field_of_view, scan
+        )
+        return target, traversability
 
     def _path_invalid(self) -> bool:
         if not self.path:
@@ -143,6 +151,29 @@ class AutonomousSearchAndRescue:
         if first is None or second is None:
             return first != second
         return math.hypot(first[0] - second[0], first[1] - second[1]) > threshold
+
+    def _retire_frontier(
+        self,
+        now: float,
+        goal: Optional[Tuple[float, float]],
+    ) -> None:
+        """Temporarily suppress a reached frontier that the map still exposes."""
+        if goal is None:
+            return
+        expires_at = now + CONFIG.planner.frontier_exclusion_time
+        for index, (x, y, _) in enumerate(self.retired_frontiers):
+            if math.hypot(goal[0] - x, goal[1] - y) <= (
+                CONFIG.planner.frontier_exclusion_radius
+            ):
+                self.retired_frontiers[index] = (goal[0], goal[1], expires_at)
+                return
+        self.retired_frontiers.append((goal[0], goal[1], expires_at))
+
+    def _frontier_exclusions(self, now: float) -> List[Tuple[float, float]]:
+        self.retired_frontiers = [
+            item for item in self.retired_frontiers if item[2] > now
+        ]
+        return [(x, y) for x, y, _ in self.retired_frontiers]
 
     def _record_breadcrumb(self) -> None:
         if self.mission.phase not in (
@@ -245,9 +276,26 @@ class AutonomousSearchAndRescue:
             self.return_detour_active = False
             reached = self.frontier_goal is not None and math.hypot(
                 pose.x - self.frontier_goal[0], pose.y - self.frontier_goal[1]
-            ) < CONFIG.planner.goal_tolerance
-            if reached or self.frontier_goal is None or (periodic and self._path_invalid()):
-                self.frontier_goal, result = self.explorer.choose(self.grid, pose)
+            ) < CONFIG.planner.frontier_reached_distance
+            endpoint_reached = bool(self.path) and math.hypot(
+                pose.x - self.path[-1][0], pose.y - self.path[-1][1]
+            ) < CONFIG.planner.frontier_reached_distance
+            # Occlusion can leave a frontier in the grid after the robot has
+            # already inspected it. Retire it before replanning so the next
+            # cycle cannot select the same zero-motion endpoint indefinitely.
+            if reached or endpoint_reached:
+                self._retire_frontier(now, self.frontier_goal)
+            if (
+                reached
+                or endpoint_reached
+                or self.frontier_goal is None
+                or (periodic and self._path_invalid())
+            ):
+                self.frontier_goal, result = self.explorer.choose(
+                    self.grid,
+                    pose,
+                    self._frontier_exclusions(now),
+                )
                 self.path = list(result.path) if result is not None else []
                 self.current_goal = self.frontier_goal
                 self.last_plan_time = now
@@ -406,6 +454,7 @@ class AutonomousSearchAndRescue:
                 self.dt,
                 self.dynamic_frame.planning_tracks,
                 now,
+                self.traversability_frame,
             )
             return ControlCommand(planned.linear, planned.angular, "visual DWA")
 
@@ -423,6 +472,7 @@ class AutonomousSearchAndRescue:
                 self.dt,
                 self.dynamic_frame.planning_tracks,
                 now,
+                self.traversability_frame,
             )
             if phase == MissionPhase.RETURN_HOME and (
                 self.return_direct_approach or self.return_breadcrumb_active
@@ -486,6 +536,12 @@ class AutonomousSearchAndRescue:
             "map_cells": self.grid.observed_count,
             "target_confidence": round(self.last_detection.confidence, 3),
             "target_range": None if self.last_detection.range_m is None else round(self.last_detection.range_m, 3),
+            "visual_free_confidence": (
+                round(float(np.mean(self.traversability_frame.confidence)), 3)
+                if self.traversability_frame.confidence.size
+                else 0.0
+            ),
+            "vision_lidar_hits": int(np.count_nonzero(self.traversability_frame.lidar_hits)),
             "targets_visited": self.mission.visited_count,
             "targets_required": CONFIG.mission.required_target_count,
             "command": [round(self.last_command.linear, 3), round(self.last_command.angular, 3)],
@@ -519,6 +575,7 @@ class AutonomousSearchAndRescue:
             f"pose=({pose.x:+.2f},{pose.y:+.2f},{pose.theta:+.2f}) "
             f"known={status['map_cells']:5d} target={status['target_confidence']:.2f}/"
             f"{status['target_range'] if status['target_range'] is not None else '-'}m "
+            f"vision={status['visual_free_confidence']:.2f}/{status['vision_lidar_hits']} "
             f"visited={status['targets_visited']}/{status['targets_required']} "
             f"dyn={status['dynamic_tracks']}/{status['planning_tracks']}/{status['active_tracks']} "
             f"ttc={status['ttc'] if status['ttc'] is not None else '-'} "
@@ -551,7 +608,7 @@ class AutonomousSearchAndRescue:
                 )
                 self.grid.update(self.estimator.pose, scan, self.dynamic_frame.ignored_hit_mask)
                 self.grid.decay_dynamic_regions(self.dynamic_frame.tracks)
-                self.last_detection = self._detection(scan)
+                self.last_detection, self.traversability_frame = self._perception(scan)
                 self._record_breadcrumb()
 
                 transition = self.mission.update(now, self.estimator.pose, self.last_detection)
@@ -583,6 +640,8 @@ class AutonomousSearchAndRescue:
                     self.mission.phase not in (MissionPhase.BOOTSTRAP, MissionPhase.RECOVERY, MissionPhase.COMPLETE)
                     and self.safety.is_stuck(now, self.estimator.pose, command)
                 ):
+                    if self.mission.phase == MissionPhase.EXPLORE:
+                        self._retire_frontier(now, self.frontier_goal)
                     self.mission.enter_recovery(now, "commanded motion without pose progress")
                     command = self.safety.guard(
                         ControlCommand(-0.05, 0.9, "begin stuck recovery"),

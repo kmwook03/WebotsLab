@@ -14,6 +14,7 @@ from models import ControlCommand, DynamicObstacle, Pose2D
 class CollisionPrediction:
     min_clearance: float = math.inf
     ttc: float | None = None
+    final_clearance: float = math.inf
 
 
 def rollout_command(
@@ -53,7 +54,9 @@ def predict_dynamic_clearance(
     states = rollout_command(pose, command, horizon, dt)
     min_clearance = math.inf
     ttc = None
-    for elapsed, x, y, _ in states:
+    final_clearance = math.inf
+    for state_index, (elapsed, x, y, _) in enumerate(states):
+        state_clearance = math.inf
         for obstacle in obstacles:
             unseen = max(0.0, now - obstacle.last_seen)
             # Track coordinates are anchored at the last observation, not at
@@ -68,9 +71,12 @@ def predict_dynamic_clearance(
             required = robot.robot_radius + obstacle.radius + config.safety_margin + uncertainty
             clearance = math.hypot(float(x) - ox, float(y) - oy) - required
             min_clearance = min(min_clearance, clearance)
+            state_clearance = min(state_clearance, clearance)
             if clearance < 0.0 and ttc is None:
                 ttc = float(elapsed)
-    return CollisionPrediction(min_clearance, ttc)
+        if state_index == len(states) - 1:
+            final_clearance = state_clearance
+    return CollisionPrediction(min_clearance, ttc, final_clearance)
 
 
 def minimum_static_clearance(

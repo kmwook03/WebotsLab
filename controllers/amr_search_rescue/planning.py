@@ -16,6 +16,7 @@ from models import (
     LaserScan,
     PlanResult,
     Pose2D,
+    TraversabilityFrame,
     Velocity,
     angle_difference,
     transform_points,
@@ -372,7 +373,12 @@ class FrontierExplorer:
             components.append(component)
         return components
 
-    def choose(self, grid: OccupancyGrid, pose: Pose2D) -> Tuple[Optional[WorldPoint], Optional[PlanResult]]:
+    def choose(
+        self,
+        grid: OccupancyGrid,
+        pose: Pose2D,
+        excluded_goals: Sequence[WorldPoint] = (),
+    ) -> Tuple[Optional[WorldPoint], Optional[PlanResult]]:
         components = [
             component
             for component in self._components(grid.frontier_mask())
@@ -390,6 +396,13 @@ class FrontierExplorer:
                 component,
                 key=lambda cell: (cell[0] - centroid_x) ** 2 + (cell[1] - centroid_y) ** 2,
             )
+            goal = grid.grid_to_world(*representative)
+            if any(
+                math.hypot(goal[0] - excluded[0], goal[1] - excluded[1])
+                <= self.config.frontier_exclusion_radius
+                for excluded in excluded_goals
+            ):
+                continue
             distance = math.hypot(representative[0] - start_cell[0], representative[1] - start_cell[1])
             optimistic = (
                 self.config.information_gain_weight * len(component)
@@ -443,6 +456,7 @@ class DynamicWindowPlanner:
         control_dt: float,
         dynamic_obstacles: Sequence[DynamicObstacle],
         now: float,
+        traversability: Optional[TraversabilityFrame] = None,
     ) -> ControlCommand:
         if not path:
             return ControlCommand(0.0, 0.55, "no-path search")
@@ -470,6 +484,7 @@ class DynamicWindowPlanner:
                     lookahead,
                     goal,
                     now,
+                    traversability,
                 )
                 if score > best_score:
                     best_score = score
@@ -491,9 +506,11 @@ class DynamicWindowPlanner:
         lookahead: WorldPoint,
         goal: WorldPoint,
         now: float,
+        traversability: Optional[TraversabilityFrame] = None,
     ) -> float:
         x, y, theta = pose.x, pose.y, pose.theta
         min_clearance = 5.0
+        visual_cost = 0.0
         steps = max(1, int(self.config.dwa_horizon / self.config.dwa_dt))
         for _ in range(steps):
             theta += angular * self.config.dwa_dt
@@ -504,6 +521,17 @@ class DynamicWindowPlanner:
                 min_clearance = min(min_clearance, clearance)
                 if clearance < self.robot.robot_radius + self.robot.safety_margin:
                     return -math.inf
+            if traversability is not None and linear > 0.0:
+                distance = math.hypot(x - pose.x, y - pose.y)
+                bearing = angle_difference(
+                    math.atan2(y - pose.y, x - pose.x), pose.theta
+                )
+                visual_cost = max(
+                    visual_cost,
+                    self._visual_traversability_cost(
+                        traversability, bearing, distance
+                    ),
+                )
 
         braking_distance = linear * linear / max(0.1, 2.0 * self.robot.max_linear_accel)
         if min_clearance < braking_distance + self.robot.robot_radius + self.robot.safety_margin:
@@ -538,5 +566,36 @@ class DynamicWindowPlanner:
             + 0.45 * linear / max(0.01, self.robot.max_linear_speed)
             - 0.65 * path_distance
             - 0.05 * abs(angular)
+            - self.config.visual_traversability_weight * visual_cost
         )
+
+    @staticmethod
+    def _visual_traversability_cost(
+        frame: TraversabilityFrame,
+        bearing: float,
+        travel_distance: float,
+    ) -> float:
+        """Return a soft risk for a rollout direction in the current image."""
+        if frame.bearings.size == 0:
+            return 0.0
+        differences = np.abs(
+            np.arctan2(
+                np.sin(frame.bearings - bearing),
+                np.cos(frame.bearings - bearing),
+            )
+        )
+        index = int(np.argmin(differences))
+        if frame.bearings.size > 1:
+            spacing = float(np.median(np.abs(np.diff(frame.bearings))))
+        else:
+            spacing = math.radians(5.0)
+        if float(differences[index]) > max(math.radians(3.0), 1.5 * spacing):
+            return 0.0
+
+        visual_risk = 1.0 - float(np.clip(frame.confidence[index], 0.0, 1.0))
+        if not bool(frame.lidar_hits[index]):
+            return 0.15 * visual_risk
+        lidar_range = max(0.05, float(frame.lidar_ranges[index]))
+        approach = float(np.clip(travel_distance / lidar_range, 0.0, 1.0))
+        return visual_risk * (0.45 + 0.55 * approach)
 

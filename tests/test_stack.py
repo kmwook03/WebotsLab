@@ -9,13 +9,13 @@ import numpy as np
 CONTROLLER = Path(__file__).resolve().parents[1] / "controllers" / "amr_search_rescue"
 sys.path.insert(0, str(CONTROLLER))
 
-from config import DynamicObstacleConfig, MapConfig, MissionConfig, PlannerConfig, RobotConfig, SafetyConfig, TargetConfig  # noqa: E402
+from config import DynamicObstacleConfig, MapConfig, MissionConfig, PlannerConfig, RobotConfig, SafetyConfig, TargetConfig, TraversabilityConfig  # noqa: E402
 from collision import predict_dynamic_clearance  # noqa: E402
 from mapping import OccupancyGrid  # noqa: E402
 from localization import PoseEstimator  # noqa: E402
 from mission import MissionManager  # noqa: E402
-from models import ControlCommand, DynamicObstacle, LaserScan, MissionPhase, Pose2D, TargetDetection, Velocity, wrap_angle  # noqa: E402
-from perception import RedTargetDetector  # noqa: E402
+from models import ControlCommand, DynamicObstacle, LaserScan, MissionPhase, Pose2D, TargetDetection, TraversabilityFrame, Velocity, wrap_angle  # noqa: E402
+from perception import RedTargetDetector, TraversableAreaDetector  # noqa: E402
 from planning import AStarPlanner, DynamicWindowPlanner, FrontierExplorer, WaypointProgressMonitor, append_breadcrumb, breadcrumb_return_cost, choose_local_detour, reverse_breadcrumb_segment, terminal_approach_path  # noqa: E402
 from safety import SafetySupervisor  # noqa: E402
 from tracking import DynamicObstacleTracker  # noqa: E402
@@ -74,6 +74,31 @@ class GlobalPlanningTests(unittest.TestCase):
         self.assertIsNotNone(goal)
         self.assertIsNotNone(result)
         self.assertGreater(len(result.path), 0)
+
+    def test_reached_frontier_is_temporarily_excluded(self):
+        self.grid.log_odds.fill(-2.0)
+        self.grid.log_odds[18:24, 18:24] = 0.0
+        self.grid.log_odds[66:72, 66:72] = 0.0
+        explorer = FrontierExplorer(self.plan_config, self.planner)
+        first_goal, first_result = explorer.choose(self.grid, Pose2D())
+
+        self.assertIsNotNone(first_goal)
+        self.assertIsNotNone(first_result)
+        second_goal, second_result = explorer.choose(
+            self.grid,
+            Pose2D(*first_goal),
+            [first_goal],
+        )
+
+        self.assertIsNotNone(second_goal)
+        self.assertIsNotNone(second_result)
+        self.assertGreater(
+            math.hypot(
+                second_goal[0] - first_goal[0],
+                second_goal[1] - first_goal[1],
+            ),
+            self.plan_config.frontier_exclusion_radius,
+        )
 
 
 class LocalPlanningTests(unittest.TestCase):
@@ -392,7 +417,7 @@ class LocalPlanningTests(unittest.TestCase):
         )
         self.assertTrue(all(command.reason != "front escape turn" for command in commands))
 
-    def test_evasive_margin_rejects_tight_dynamic_escape(self):
+    def test_evasive_margin_changes_tight_dynamic_escape(self):
         angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
         scan = LaserScan(np.full(360, np.inf, dtype=np.float32), angles, 0.05, 3.5)
         obstacle = DynamicObstacle(1, 0.35, -0.20, -0.40, 0.0, 0.16, 1.0, 0.0)
@@ -407,7 +432,38 @@ class LocalPlanningTests(unittest.TestCase):
         strict_command = strict._evasive_command(Pose2D(), scan, (obstacle,), 0.0)
 
         self.assertTrue(loose_command.reason.startswith("predictive evasive"))
-        self.assertEqual(strict_command.reason, "predictive safety stop")
+        self.assertTrue(strict_command.reason.startswith("predictive evasive"))
+        self.assertNotEqual(
+            (loose_command.linear, loose_command.angular),
+            (strict_command.linear, strict_command.angular),
+        )
+
+    def test_closing_person_inside_margin_uses_best_effort_escape(self):
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        ranges = np.full(360, np.inf, dtype=np.float32)
+        side = int(np.argmin(np.abs(angles - math.pi / 2.0)))
+        ranges[side - 4 : side + 5] = 0.16
+        scan = LaserScan(ranges, angles, 0.05, 3.5)
+        obstacle = DynamicObstacle(
+            1, 0.0, 0.30, 0.0, -0.35, 0.16, 1.0, 0.0
+        )
+        robot = RobotConfig()
+        dynamic = DynamicObstacleConfig()
+        supervisor = SafetySupervisor(robot, SafetyConfig(), dynamic)
+
+        command = supervisor._evasive_command(Pose2D(), scan, (obstacle,), 0.0)
+        recovery_config = DynamicObstacleConfig(
+            safety_margin=dynamic.evasive_safety_margin
+        )
+        escape = predict_dynamic_clearance(
+            Pose2D(), command, (obstacle,), robot, recovery_config, 0.0
+        )
+        stopped = predict_dynamic_clearance(
+            Pose2D(), ControlCommand(), (obstacle,), robot, recovery_config, 0.0
+        )
+
+        self.assertTrue(command.reason.startswith("predictive evasive"))
+        self.assertGreater(escape.final_clearance, stopped.final_clearance)
 
     def test_pretrack_layer_stops_for_compact_untracked_closing_object(self):
         angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
@@ -817,6 +873,54 @@ class DynamicObstacleTrackingTests(unittest.TestCase):
 
 
 class PerceptionAndMissionTests(unittest.TestCase):
+    def test_traversable_floor_segmentation_and_lidar_alignment(self):
+        height, width = 96, 160
+        image = np.zeros((height, width, 4), dtype=np.uint8)
+        image[:, :, 3] = 255
+        image[:40, :, :3] = (45, 45, 45)
+        image[40:, :, :3] = (178, 185, 180)
+        image[54:, 66:94, :3] = (28, 58, 105)
+
+        angles = np.linspace(math.pi, -math.pi, 360, dtype=np.float32)
+        ranges = np.full(360, np.inf, dtype=np.float32)
+        ranges[np.abs(angles) < math.radians(3.0)] = 0.82
+        scan = LaserScan(ranges, angles, 0.05, 3.5)
+
+        frame = TraversableAreaDetector().detect(
+            image.tobytes(), width, height, 1.1, scan
+        )
+        centre = int(np.argmin(np.abs(frame.bearings)))
+        side = int(np.argmin(np.abs(frame.bearings - 0.38)))
+
+        self.assertLess(frame.confidence[centre], 0.15)
+        self.assertGreater(frame.confidence[side], 0.80)
+        self.assertTrue(frame.lidar_hits[centre])
+        self.assertAlmostEqual(frame.lidar_ranges[centre], 0.82, delta=0.03)
+        self.assertFalse(frame.lidar_hits[side])
+        self.assertAlmostEqual(frame.lidar_ranges[side], scan.max_range)
+
+    def test_visual_traversability_cost_needs_lidar_corroboration(self):
+        frame = TraversabilityFrame(
+            bearings=np.array([0.4, 0.0, -0.4], dtype=np.float32),
+            confidence=np.array([1.0, 0.1, 0.1], dtype=np.float32),
+            lidar_ranges=np.array([3.5, 0.8, 3.5], dtype=np.float32),
+            lidar_hits=np.array([False, True, False]),
+        )
+
+        centre_cost = DynamicWindowPlanner._visual_traversability_cost(
+            frame, 0.0, 0.6
+        )
+        colour_only_cost = DynamicWindowPlanner._visual_traversability_cost(
+            frame, -0.4, 0.6
+        )
+        clear_cost = DynamicWindowPlanner._visual_traversability_cost(
+            frame, 0.4, 0.6
+        )
+
+        self.assertGreater(centre_cost, 0.65)
+        self.assertLess(colour_only_cost, 0.15)
+        self.assertEqual(clear_cost, 0.0)
+
     def test_red_target_and_lidar_association(self):
         height, width = 96, 160
         image = np.zeros((height, width, 4), dtype=np.uint8)

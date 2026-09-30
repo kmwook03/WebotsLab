@@ -5,8 +5,120 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from config import TargetConfig
-from models import LaserScan, TargetDetection
+from config import TargetConfig, TraversabilityConfig
+from models import LaserScan, TargetDetection, TraversabilityFrame
+
+
+class TraversableAreaDetector:
+    """Find bottom-connected floor pixels and align columns with LiDAR rays.
+
+    The detector deliberately uses no simulator labels or learned model.  A
+    robust colour reference is estimated from the image's bottom band, then
+    each column is followed upward until a sustained non-floor region occurs.
+    This makes an obstacle interrupt the visible floor even when similarly
+    coloured floor remains visible on either side of it.
+    """
+
+    def __init__(self, config: Optional[TraversabilityConfig] = None):
+        self.config = config or TraversabilityConfig()
+
+    def _floor_mask(self, bgra: bytes, width: int, height: int) -> np.ndarray:
+        image = np.frombuffer(bgra, dtype=np.uint8).reshape((height, width, 4))
+        rgb = image[:, :, [2, 1, 0]].astype(np.float32) / 255.0
+        intensity = np.mean(rgb, axis=2)
+        chromaticity = rgb / np.maximum(np.sum(rgb, axis=2, keepdims=True), 1e-4)
+
+        band_height = max(2, int(round(height * self.config.reference_band_ratio)))
+        reference_pixels = rgb[height - band_height :, :, :].reshape(-1, 3)
+        reference_rgb = np.median(reference_pixels, axis=0)
+        reference_intensity = float(np.mean(reference_rgb))
+        reference_chromaticity = reference_rgb / max(float(np.sum(reference_rgb)), 1e-4)
+
+        chromaticity_error = np.linalg.norm(
+            chromaticity - reference_chromaticity[None, None, :], axis=2
+        )
+        intensity_error = np.abs(intensity - reference_intensity)
+        raw_floor = (
+            (chromaticity_error <= self.config.chromaticity_threshold)
+            & (intensity_error <= self.config.intensity_threshold)
+        )
+
+        horizon = min(height - 1, max(0, int(round(height * self.config.horizon_ratio))))
+        raw_floor[:horizon, :] = False
+        connected = np.zeros_like(raw_floor)
+        max_gap = max(0, self.config.max_vertical_gap)
+        for x in range(width):
+            misses = 0
+            for y in range(height - 1, horizon - 1, -1):
+                if raw_floor[y, x]:
+                    misses = max(0, misses - 1)
+                    connected[y, x] = True
+                else:
+                    misses += 1
+                    if misses > max_gap:
+                        break
+        return connected
+
+    def detect(
+        self,
+        bgra: bytes,
+        width: int,
+        height: int,
+        field_of_view: float,
+        scan: LaserScan,
+    ) -> TraversabilityFrame:
+        if not bgra or width <= 0 or height <= 0:
+            return TraversabilityFrame.empty()
+
+        floor_mask = self._floor_mask(bgra, width, height)
+        horizon = min(height - 1, max(0, int(round(height * self.config.horizon_ratio))))
+        stride = max(1, self.config.column_stride)
+        bearings = []
+        confidences = []
+        lidar_ranges = []
+        lidar_hits = []
+        gate = math.radians(self.config.lidar_bearing_gate_deg)
+
+        for start in range(0, width, stride):
+            stop = min(width, start + stride)
+            centre_x = 0.5 * (start + stop - 1)
+            bearing = (0.5 - centre_x / max(1.0, width - 1.0)) * field_of_view
+            confidence = float(np.mean(floor_mask[horizon:, start:stop]))
+            difference = np.abs(
+                np.arctan2(
+                    np.sin(scan.angles - bearing),
+                    np.cos(scan.angles - bearing),
+                )
+            )
+            associated = difference <= gate
+            hit_values = scan.ranges[associated & scan.valid_mask(include_max_range=False)]
+            if hit_values.size:
+                lidar_range = float(
+                    np.percentile(hit_values, self.config.lidar_percentile)
+                )
+                lidar_hit = True
+            else:
+                lidar_range = float(scan.max_range)
+                lidar_hit = False
+            bearings.append(bearing)
+            confidences.append(confidence)
+            lidar_ranges.append(lidar_range)
+            lidar_hits.append(lidar_hit)
+
+        confidence_array = np.asarray(confidences, dtype=np.float32)
+        if confidence_array.size >= 3:
+            confidence_array = np.convolve(
+                confidence_array,
+                np.array([0.2, 0.6, 0.2], dtype=np.float32),
+                mode="same",
+            ).astype(np.float32)
+        return TraversabilityFrame(
+            bearings=np.asarray(bearings, dtype=np.float32),
+            confidence=np.clip(confidence_array, 0.0, 1.0),
+            lidar_ranges=np.asarray(lidar_ranges, dtype=np.float32),
+            lidar_hits=np.asarray(lidar_hits, dtype=bool),
+            floor_mask=floor_mask,
+        )
 
 
 class RedTargetDetector:

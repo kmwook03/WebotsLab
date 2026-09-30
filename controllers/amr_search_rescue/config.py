@@ -54,10 +54,27 @@ class TargetConfig:
 
 
 @dataclass(frozen=True)
+class TraversabilityConfig:
+    """Parameters for bottom-up RGB floor segmentation and LiDAR fusion."""
+
+    horizon_ratio: float = 0.42
+    reference_band_ratio: float = 0.16
+    chromaticity_threshold: float = 0.105
+    intensity_threshold: float = 0.28
+    max_vertical_gap: int = 2
+    column_stride: int = 4
+    lidar_bearing_gate_deg: float = 2.5
+    lidar_percentile: float = 20.0
+
+
+@dataclass(frozen=True)
 class PlannerConfig:
     inflation_radius: float = 0.20
     frontier_min_cells: int = 7
     frontier_candidate_limit: int = 12
+    frontier_reached_distance: float = 0.35
+    frontier_exclusion_radius: float = 0.55
+    frontier_exclusion_time: float = 20.0
     information_gain_weight: float = 0.022
     travel_cost_weight: float = 1.0
     replan_period: float = 1.0
@@ -67,6 +84,7 @@ class PlannerConfig:
     dwa_dt: float = 0.15
     dwa_linear_samples: int = 6
     dwa_angular_samples: int = 13
+    visual_traversability_weight: float = 0.90
     return_direct_approach_distance: float = 1.80
     return_endpoint_error: float = 0.35
     return_detour_waypoint_distance: float = 0.70
@@ -166,6 +184,7 @@ class Config:
     robot: RobotConfig = field(default_factory=RobotConfig)
     mapping: MapConfig = field(default_factory=MapConfig)
     target: TargetConfig = field(default_factory=TargetConfig)
+    traversability: TraversabilityConfig = field(default_factory=TraversabilityConfig)
     planner: PlannerConfig = field(default_factory=PlannerConfig)
     dynamic: DynamicObstacleConfig = field(default_factory=DynamicObstacleConfig)
     mission: MissionConfig = field(default_factory=MissionConfig)

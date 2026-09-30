@@ -22,14 +22,16 @@ robotics:
    LiDAR scan matching and a maintained 3x3 pose covariance.
 3. **Mapping** - NumPy log-odds occupancy grid, ray casting, evidence clamping,
    stale-obstacle decay, dynamic-hit exclusion, and footprint inflation.
-4. **Perception** - raw-camera red-target segmentation, denoising, bounding-box
-   extraction, temporal confidence, and LiDAR range association. Webots
-   recognition metadata is not used.
+4. **Perception** - raw-camera red-target segmentation plus bottom-connected
+   traversable-floor segmentation. Camera columns are associated with LiDAR
+   bearings and ranges without using Webots recognition metadata.
 5. **Global planning** - connected frontier selection, information-gain scoring,
    8-connected A*, clearance-aware costs, and line-of-sight path smoothing.
 6. **Dynamic tracking and local planning** - ego-motion-compensated compact
    LiDAR cluster tracking plus acceleration-constrained DWA. Candidate rollouts
-   reject both static returns and predicted moving-obstacle positions. A
+   reject both static returns and predicted moving-obstacle positions, while a
+   fused visual-traversability layer adds a soft cost to directions where the
+   floor is interrupted and a nearby LiDAR return corroborates it. A
    motion-consistent two-hit planning track gives DWA early warning before the
    stricter confirmed track is used for mapping and telemetry; short occlusions
    are projected forward from the last observation time.
@@ -72,12 +74,14 @@ python -m unittest discover -s tests -v
 ```
 
 The tests cover geometry, occupancy updates, A* around an obstacle, frontier
-selection, dynamic-cluster tracking, predicted crossing rejection, safety
+selection, RGB floor segmentation, camera/LiDAR bearing association,
+dynamic-cluster tracking, predicted crossing rejection, safety
 hysteresis, dynamic-map exclusion, target detection, visited-target rejection,
 target-lock continuity, and mission transitions.
 
-Status messages include confirmed/planning/active track counts, predicted TTC, the
-active safety reason, and compact track position/velocity summaries. The map
+Status messages include visual free-space confidence and associated LiDAR-hit
+counts, confirmed/planning/active track counts, predicted TTC, the active safety
+reason, and compact track position/velocity summaries. The map
 display draws confirmed tracks and their one-second velocity vectors in orange.
 
 ## Tunable parameters

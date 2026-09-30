@@ -100,6 +100,27 @@ class TargetDetection:
 
 
 @dataclass
+class TraversabilityFrame:
+    """Camera-column floor confidence with range-aligned LiDAR evidence."""
+
+    bearings: np.ndarray
+    confidence: np.ndarray
+    lidar_ranges: np.ndarray
+    lidar_hits: np.ndarray
+    floor_mask: Optional[np.ndarray] = None
+
+    @classmethod
+    def empty(cls) -> "TraversabilityFrame":
+        return cls(
+            np.empty(0, dtype=np.float32),
+            np.empty(0, dtype=np.float32),
+            np.empty(0, dtype=np.float32),
+            np.empty(0, dtype=bool),
+            None,
+        )
+
+
+@dataclass
 class PlanResult:
     path: Sequence[Tuple[float, float]]
     cost: float

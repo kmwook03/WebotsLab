@@ -279,6 +279,25 @@ class SafetySupervisor:
         now: float,
     ) -> ControlCommand:
         points_world = transform_points(scan.points_robot(include_max_range=False), pose)
+        # A moving track is evaluated by the predictive model below. Remove
+        # its live LiDAR surface from the static cloud or a nearby person is
+        # counted twice and every translational escape can be rejected as if
+        # that person were a stationary wall.
+        if points_world.size:
+            static_points = np.ones(len(points_world), dtype=bool)
+            for obstacle in obstacles:
+                if math.hypot(obstacle.vx, obstacle.vy) < self.dynamic_config.moving_speed:
+                    continue
+                unseen = max(0.0, now - obstacle.last_seen)
+                obstacle_x, obstacle_y = obstacle.predicted_position(unseen)
+                static_points &= (
+                    np.hypot(
+                        points_world[:, 0] - obstacle_x,
+                        points_world[:, 1] - obstacle_y,
+                    )
+                    > obstacle.radius + 0.10
+                )
+            points_world = points_world[static_points]
         candidates = [ControlCommand(0.0, 0.0, "predictive safety stop")]
         for linear in (-0.28, -0.18, -0.10, 0.0, 0.10, 0.18, 0.28):
             for angular in (-1.35, -0.75, 0.0, 0.75, 1.35):
@@ -292,6 +311,7 @@ class SafetySupervisor:
             safety_margin=self.dynamic_config.evasive_safety_margin,
         )
         safe_candidates = []
+        best_effort_candidates = []
         for candidate in candidates:
             static_clearance = minimum_static_clearance(
                 pose,
@@ -327,16 +347,34 @@ class SafetySupervisor:
                 recovery_config,
                 now,
             )
-            if prediction.ttc is not None:
-                continue
             clearance = prediction.min_clearance
             if not math.isfinite(clearance):
                 clearance = 5.0
+            final_clearance = prediction.final_clearance
+            if not math.isfinite(final_clearance):
+                final_clearance = 5.0
             effort = abs(candidate.linear) + 0.05 * abs(candidate.angular)
+            best_effort_score = (
+                3.0 * final_clearance
+                + 0.6 * clearance
+                + 0.8 * min(end_static_clearance, 1.0)
+                - 0.08 * effort
+            )
+            best_effort_candidates.append(
+                (best_effort_score, final_clearance, clearance, candidate)
+            )
+            if prediction.ttc is not None:
+                continue
             score = 2.0 * clearance + 0.8 * min(end_static_clearance, 1.0) - 0.08 * effort
             safe_candidates.append((score, clearance, end_static_clearance, candidate))
         if not safe_candidates:
-            return candidates[0]
+            if not best_effort_candidates:
+                return candidates[0]
+            # Once the conservative envelope is already violated, stopping is
+            # not automatically safe: a person may continue walking into the
+            # stationary robot. Select the statically valid command that opens
+            # the greatest predicted separation by the end of the escape.
+            return max(best_effort_candidates, key=lambda item: item[0])[3]
         best_score, _, _, best = max(safe_candidates, key=lambda item: item[0])
         stop_entry = next(
             (item for item in safe_candidates if item[3].reason == "predictive safety stop"),
